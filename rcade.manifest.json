@@ -3,7 +3,7 @@
   "name": "rhythm-game",
   "display_name": "Rhythm Game",
   "description": "A rhythm game for the rcade",
-  "visibility": "private",
+  "visibility": "internal",
   "authors": [
     {
       "display_name": "kpthill"

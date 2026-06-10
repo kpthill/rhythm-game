@@ -2,7 +2,8 @@ import p5 from "p5";
 import { sampleInput, DIRECTION_ANGLE } from "./input";
 import type { InputSnapshot, Direction } from "./input";
 import { AudioManager } from "./audio";
-import { BPM, SONG_FILE, CHART } from "./chart";
+import { OFFSET, BPMS, STOPS, SONG_FILE, CHART, SONG_LENGTH_BEATS } from "./chart";
+import { secondsToBeat } from "./timing";
 import {
     BUTTON_COLOR, HIT_ZONE_RADIUS, CX, CY,
     LOOKAHEAD_BEATS, HIT_WINDOW_BEATS,
@@ -33,6 +34,8 @@ const sketch = (p: p5) => {
     let combo = 0;
     let life = 1.0;
     let judgments: Judgment[] = [];
+    let beatLog: Array<{ beat: number; btn: "A" | "B" }> = [];
+    let failed = false;
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -94,7 +97,7 @@ const sketch = (p: p5) => {
                 const buttonPressed = ev.button === "A" ? input.aPressed : input.bPressed;
                 const dirMatch = input.direction === ev.direction;
 
-                if (buttonPressed && dirMatch && Math.abs(beatDiff) <= HIT_WINDOW_BEATS * 2) {
+                if (buttonPressed && dirMatch && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
                     const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * 1;
                     registerHit(perfect ? 300 : 100, perfect ? "PERFECT" : "GOOD", note);
                 } else if (beatDiff > HIT_WINDOW_BEATS) {
@@ -306,7 +309,28 @@ const sketch = (p: p5) => {
             p.text(j.text, j.x, j.y + dy);
         }
 
-        void currentBeat; // available for future debug overlay
+        // Charting overlay – left strip
+        p.textFont("monospace");
+        p.textAlign(p.LEFT, p.TOP);
+        p.noStroke();
+
+        // Live beat counter
+        p.fill(160, 150, 200);
+        p.textSize(9);
+        p.text("beat", 4, 18);
+        p.fill(220, 215, 255);
+        p.textSize(11);
+        p.text(currentBeat.toFixed(2), 4, 28);
+
+        // Recent press log (newest at top)
+        for (let i = 0; i < beatLog.length; i++) {
+            const entry = beatLog[i];
+            const alpha = p.map(i, 0, beatLog.length, 220, 60);
+            const [r, g, b] = entry.btn === "A" ? BUTTON_COLOR.A : BUTTON_COLOR.B;
+            p.fill(r, g, b, alpha);
+            p.textSize(8);
+            p.text(`${entry.btn} ${entry.beat.toFixed(2)}`, 4, 44 + i * 10);
+        }
     }
 
     function drawLoading(): void {
@@ -345,12 +369,26 @@ const sketch = (p: p5) => {
             combo = 0;
             life = 1.0;
             judgments = [];
+            beatLog = [];
+            failed = false;
             void audio.play(0);
         }
     }
 
     function drawPlaying(input: InputSnapshot): void {
-        const cb = audio.currentBeat(BPM);
+        const cb = secondsToBeat(audio.currentSeconds, OFFSET, BPMS, STOPS);
+
+        // Charting helper: record every button press regardless of note matching
+        if (input.aPressed) {
+            beatLog.unshift({ beat: cb, btn: "A" });
+            if (beatLog.length > 12) beatLog.pop();
+            console.log(`A\t${cb.toFixed(2)}`);
+        }
+        if (input.bPressed) {
+            beatLog.unshift({ beat: cb, btn: "B" });
+            if (beatLog.length > 12) beatLog.pop();
+            console.log(`B\t${cb.toFixed(2)}`);
+        }
 
         drawTunnel(cb);
         spawnNotes(cb);
@@ -359,13 +397,9 @@ const sketch = (p: p5) => {
         drawInputIndicator(input);
         drawHUD(cb);
 
-        if (life <= 0) {
-            audio.stop();
-            state = "RESULT";
-        } else if (
-            chartIndex >= CHART.length &&
-            activeNotes.every(n => n.hit || n.missed)
-        ) {
+        if (life <= 0) failed = true;
+
+        if (cb >= SONG_LENGTH_BEATS) {
             audio.stop();
             state = "RESULT";
         }
@@ -382,7 +416,7 @@ const sketch = (p: p5) => {
         p.textAlign(p.CENTER, p.CENTER);
         p.fill(220, 210, 255);
         p.textSize(18);
-        p.text(life <= 0 ? "GAME OVER" : "CLEAR!", CX, CY - 25);
+        p.text(failed ? "FAIL" : "CLEAR!", CX, CY - 25);
         p.textSize(12);
         p.text(`SCORE: ${score}`, CX, CY + 5);
         p.fill(150, 140, 180);

@@ -26,8 +26,8 @@ export const BUTTON_COLOR: Record<Button, [number, number, number]> = {
 export const HIT_ZONE_RADIUS = 100;
 export const CX = 168;
 export const CY = 131;
-export const LOOKAHEAD_BEATS = 4;   // ~1.5 s at 160 BPM
-export const HIT_WINDOW_BEATS = 0.12;  // ±60 ms at 120 BPM
+export const LOOKAHEAD_BEATS = 8;
+export const HIT_WINDOW_BEATS = 0.5;
 
 // Radius of note head at a given beat
 export function noteRadius(noteBeat: number, currentBeat: number): number {
