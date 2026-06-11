@@ -2,7 +2,7 @@ import p5 from "p5";
 import { sampleInput, DIRECTION_ANGLE } from "./input";
 import type { InputSnapshot, Direction } from "./input";
 import { AudioManager } from "./audio";
-import { OFFSET, BPMS, STOPS, SONG_FILE, CHART, SONG_LENGTH_BEATS } from "./chart";
+import { OFFSET, BPMS, STOPS, SONG_FILE, CHARTS, SONG_LENGTH_BEATS } from "./chart";
 import { secondsToBeat } from "./timing";
 import {
     BUTTON_COLOR, HIT_ZONE_RADIUS, CX, CY,
@@ -11,7 +11,7 @@ import {
 } from "./notes";
 import type { ActiveNote, Button } from "./notes";
 
-type GameState = "LOADING" | "TITLE" | "PLAYING" | "RESULT";
+type GameState = "LOADING" | "TITLE" | "SELECT" | "PLAYING" | "RESULT";
 
 // Pixels between rings that are one beat apart
 const BEAT_PX = HIT_ZONE_RADIUS / LOOKAHEAD_BEATS;
@@ -36,6 +36,10 @@ const sketch = (p: p5) => {
     let judgments: Judgment[] = [];
     let beatLog: Array<{ beat: number; btn: "A" | "B" }> = [];
     let failed = false;
+
+    let selectedChart = 0;
+    let activeChart = CHARTS[0].notes;
+    let menuLatch = false;
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -70,8 +74,8 @@ const sketch = (p: p5) => {
     // ── Game logic ─────────────────────────────────────────────────────────────
 
     function spawnNotes(currentBeat: number): void {
-        while (chartIndex < CHART.length) {
-            const ev = CHART[chartIndex];
+        while (chartIndex < activeChart.length) {
+            const ev = activeChart[chartIndex];
             if (currentBeat >= ev.beat - LOOKAHEAD_BEATS) {
                 activeNotes.push({
                     event: ev,
@@ -156,7 +160,7 @@ const sketch = (p: p5) => {
         }
 
         // Scrolling concentric rings (every quarter-beat subdivision)
-        const SUBDIV = 4;
+        const SUBDIV = 1;
         const subPx = BEAT_PX / SUBDIV;
         const scroll = (currentBeat * SUBDIV % 1) * subPx;
 
@@ -362,7 +366,53 @@ const sketch = (p: p5) => {
         p.text("Press 1P START", CX, CY + 22);
 
         if (input.startPressed) {
-            state = "PLAYING";
+            state = "SELECT";
+        }
+    }
+
+    function drawSelect(input: InputSnapshot): void {
+        p.background(12, 8, 24);
+
+        p.noFill();
+        for (let r = 20; r <= HIT_ZONE_RADIUS; r += 20) {
+            p.stroke(60, 50, 100, p.map(r, 0, HIT_ZONE_RADIUS, 20, 60));
+            p.strokeWeight(r === HIT_ZONE_RADIUS ? 2 : 0.5);
+            p.ellipse(CX, CY, r * 2, r * 2);
+        }
+
+        p.noStroke();
+        p.textAlign(p.CENTER, p.CENTER);
+        p.fill(160, 150, 190);
+        p.textSize(9);
+        p.text("HALL OF THE MOUNTAIN KING", CX, 30);
+        p.fill(220, 210, 255);
+        p.textSize(13);
+        p.text("SELECT CHART", CX, 52);
+
+        for (let i = 0; i < CHARTS.length; i++) {
+            const y = 95 + i * 30;
+            const sel = i === selectedChart;
+            p.fill(sel ? 230 : 110, sel ? 215 : 105, sel ? 255 : 140);
+            p.textSize(sel ? 14 : 11);
+            p.text((sel ? "> " : "  ") + CHARTS[i].name, CX, y);
+        }
+
+        p.fill(110, 100, 140);
+        p.textSize(8);
+        p.text("UP/DN to choose   A to play", CX, 165);
+
+        const dirUp   = input.direction === "UP";
+        const dirDown = input.direction === "DOWN";
+        if (!dirUp && !dirDown) {
+            menuLatch = false;
+        } else if (!menuLatch) {
+            menuLatch = true;
+            if (dirUp)   selectedChart = (selectedChart - 1 + CHARTS.length) % CHARTS.length;
+            if (dirDown) selectedChart = (selectedChart + 1) % CHARTS.length;
+        }
+
+        if (input.aPressed || input.startPressed) {
+            activeChart = CHARTS[selectedChart].notes;
             activeNotes = [];
             chartIndex = 0;
             score = 0;
@@ -371,6 +421,7 @@ const sketch = (p: p5) => {
             judgments = [];
             beatLog = [];
             failed = false;
+            state = "PLAYING";
             void audio.play(0);
         }
     }
@@ -424,7 +475,7 @@ const sketch = (p: p5) => {
         p.text("Press 1P START to replay", CX, CY + 28);
 
         if (input.startPressed) {
-            state = "TITLE";
+            state = "SELECT";
         }
     }
 
@@ -447,6 +498,7 @@ const sketch = (p: p5) => {
         switch (state) {
             case "LOADING": drawLoading();        break;
             case "TITLE":   drawTitle(input);     break;
+            case "SELECT":  drawSelect(input);    break;
             case "PLAYING": drawPlaying(input);   break;
             case "RESULT":  drawResult(input);    break;
         }
