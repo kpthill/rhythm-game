@@ -1,4 +1,6 @@
-import type { Direction } from "./input";
+// Tunnel-specific note model + rendering constants (vendored; not shared with other games).
+
+import type { Direction } from "../../platform/input";
 
 export type Button = "A" | "B";
 

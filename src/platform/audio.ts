@@ -1,3 +1,9 @@
+// Sample-accurate audio playback clock built on the Web Audio API.
+//
+// A game gets a shared AudioManager (preloaded with the collection's default song)
+// via GameContext.audio. A game that wants a different track can construct its own
+// AudioManager and load() its own file (see the `amplitude` prototype).
+
 export class AudioManager {
     private ctx: AudioContext;
     private buffer: AudioBuffer | null = null;
@@ -42,7 +48,8 @@ export class AudioManager {
         return (this.ctx.currentTime - this.playStartContextTime) + this.playStartOffset;
     }
 
-    currentBeat(bpm: number): number {
-        return this.currentSeconds * (bpm / 60);
+    /** Exposed so games can build their own audio graph (filters, gains) if needed. */
+    get context(): AudioContext {
+        return this.ctx;
     }
 }

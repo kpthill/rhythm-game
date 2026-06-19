@@ -1,8 +1,8 @@
 {
   "$schema": "https://rcade.dev/manifest.schema.json",
   "name": "rhythm-game",
-  "display_name": "Rhythm Game",
-  "description": "A rhythm game for the rcade",
+  "display_name": "Rhythm Collection",
+  "description": "A collection of rhythm games for the rcade",
   "visibility": "internal",
   "authors": [
     {
@@ -12,6 +12,10 @@
   "dependencies": [
     {
       "name": "@rcade/input-classic",
+      "version": "1.0.0"
+    },
+    {
+      "name": "@rcade/input-spinners",
       "version": "1.0.0"
     }
   ]
