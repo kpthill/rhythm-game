@@ -40,6 +40,10 @@ const LIFE_REGAIN     = 0.012; // slow regain on successful hits
 const PLATTER_CY = 226;
 const PLATTER_R  = 19;
 
+// Volume control (P2 up/down — free, the charts only use P2 left/right/A/B)
+const VOLUME_PER_SEC      = 0.7;  // full range in ~1.4s of holding
+const VOLUME_INDICATOR_MS = 900;  // how long the indicator lingers after a change
+
 // ── State ────────────────────────────────────────────────────────────────────
 
 type GameState = "PLAYING" | "RESULT";
@@ -76,6 +80,8 @@ let failed = false;
 
 let leftState: LaneState;
 let rightState: LaneState;
+
+let volumeShownAtMs = -Infinity;
 
 function newLaneState(lane: Lane): LaneState {
     return {
@@ -211,7 +217,7 @@ function triggerScratchFX(dir: ScratchDir): void {
     osc.frequency.exponentialRampToValueAtTime(endFreq, now + 0.09);
     gain.gain.setValueAtTime(0.16, now);
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
-    osc.connect(gain).connect(audioCtx.destination);
+    osc.connect(gain).connect(ctx.audio.output);
     osc.start(now);
     osc.stop(now + 0.12);
 }
@@ -509,6 +515,29 @@ function drawPlatter(ls: LaneState): void {
 
 }
 
+/** Small VOL bar top-center, shown briefly while/after P2 up/down adjusts the volume. */
+function drawVolumeIndicator(nowMs: number): void {
+    const age = nowMs - volumeShownAtMs;
+    if (age > VOLUME_INDICATOR_MS) return;
+    const alpha = 230 * Math.min(1, 2 * (1 - age / VOLUME_INDICATOR_MS));
+
+    const bw = 60;
+    const bx = W / 2 - bw / 2;
+    const by = 6;
+
+    p.noStroke();
+    p.fill(25, 20, 45, alpha);
+    p.rect(bx - 22, by - 3, bw + 28, 11, 3);
+    p.fill(160, 150, 200, alpha);
+    p.textAlign(p.LEFT, p.CENTER);
+    p.textSize(5.5);
+    p.text("VOL", bx - 18, by + 2);
+    p.fill(60, 55, 90, alpha);
+    p.rect(bx, by, bw, 5, 2);
+    p.fill(140, 210, 160, alpha);
+    p.rect(bx, by, bw * ctx.audio.volume, 5, 2);
+}
+
 function drawJudgments(ls: LaneState): void {
     ls.judgments = ls.judgments.filter(j => p.frameCount - j.frame < 40);
     const cx = laneCenterX(ls.lane);
@@ -580,6 +609,14 @@ function framePlaying(input: InputSnapshot): void {
     const p1Lane = laneInputFromP1(input);
     const p2Lane = sampleP2();
 
+    // P2 up/down is free (the charts only use P2 left/right/A/B), so it doubles
+    // as a live volume control.
+    if (p2Lane.direction === "UP" || p2Lane.direction === "DOWN") {
+        const dv = (p2Lane.direction === "UP" ? 1 : -1) * VOLUME_PER_SEC * (p.deltaTime / 1000);
+        ctx.audio.volume += dv;
+        volumeShownAtMs = nowMs;
+    }
+
     spawnNotes(leftState, cb);
     spawnNotes(rightState, cb);
     evaluateLane(leftState, cb, p1Lane, nowMs);
@@ -593,6 +630,7 @@ function framePlaying(input: InputSnapshot): void {
     drawPlatter(leftState);
     drawPlatter(rightState);
     drawHUD(cb);
+    drawVolumeIndicator(nowMs);
 
     if (life <= 0 && !failed) {
         failed = true;

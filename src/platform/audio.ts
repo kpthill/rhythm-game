@@ -8,6 +8,7 @@ export class AudioManager {
     private ctx: AudioContext;
     private buffer: AudioBuffer | null = null;
     private source: AudioBufferSourceNode | null = null;
+    private masterGain: GainNode;
     private playStartContextTime = 0;
     private playStartOffset = 0;
     public loaded = false;
@@ -15,6 +16,8 @@ export class AudioManager {
 
     constructor() {
         this.ctx = new AudioContext();
+        this.masterGain = this.ctx.createGain();
+        this.masterGain.connect(this.ctx.destination);
     }
 
     async load(url: string): Promise<void> {
@@ -36,7 +39,7 @@ export class AudioManager {
         await this.ctx.resume();
         this.source = this.ctx.createBufferSource();
         this.source.buffer = this.buffer;
-        this.source.connect(this.ctx.destination);
+        this.source.connect(this.masterGain);
         this.playStartOffset = offsetSeconds;
         this.playStartContextTime = this.ctx.currentTime;
         this.source.start(0, offsetSeconds);
@@ -51,5 +54,19 @@ export class AudioManager {
     /** Exposed so games can build their own audio graph (filters, gains) if needed. */
     get context(): AudioContext {
         return this.ctx;
+    }
+
+    /** Master output node. Connect game SFX graphs here (not ctx.destination) so `volume` applies to them too. */
+    get output(): GainNode {
+        return this.masterGain;
+    }
+
+    /** Master volume, clamped to [0, 1]. Persists across games for the session (the AudioManager is shared). */
+    get volume(): number {
+        return this.masterGain.gain.value;
+    }
+
+    set volume(v: number) {
+        this.masterGain.gain.value = Math.min(1, Math.max(0, v));
     }
 }
