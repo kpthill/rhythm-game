@@ -1,10 +1,10 @@
-// DJ — turntable scratch rhythm game.
+// DJ — turntable scratch rhythm game (v2, vertical two-lane rework).
 //
-// The game showcases the spinner (rotary) input:
-//   HIT notes    : tap A or B as the note crosses the hit line.
-//   SCRATCH notes: spin CW or CCW (shown by an arrow on the note). If no
-//                  spinner is connected the player may use RIGHT (CW) or
-//                  LEFT (CCW) joystick flick as a fallback.
+// Notes fall top-to-bottom toward a shared hit line. Left lane = player 1's
+// spinner + A/B; right lane = player 2's spinner + A/B. One player straddles
+// both lanes — this is the normal way the game plays, not an expert mode.
+// Five verbs: tap, hold, double (A+B), scratch (spinner pulse, direction
+// matters), spin (sustained spinner turning). See docs/specs/dj.md.
 //
 // States: PLAYING → RESULT (then A to replay).
 
@@ -13,480 +13,591 @@ import type { GameModule, GameContext } from "../../platform/game";
 import type { InputSnapshot } from "../../platform/input";
 import { SONG_LENGTH_BEATS } from "../../platform/song";
 import { CHART } from "./chart";
-import type { ActiveNote, ScratchDir } from "./notes";
+import { sampleP2, resetP2Input, type LaneInput } from "./input2p";
+import { newGestureState, resetGestureState, sampleGesture, type GestureState, type GestureResult } from "./gesture";
+import type { Lane, NoteEvent, ActiveNote, ScratchDir, RGB } from "./notes";
 import {
-    LANE_Y, HIT_X, NOTE_W, NOTE_H,
-    LOOKAHEAD_BEATS, HIT_WINDOW_BEATS,
-    COLOR_HIT_A, COLOR_HIT_B, COLOR_SCRATCH_CW, COLOR_SCRATCH_CCW,
-    noteX,
+    LOOKAHEAD_BEATS, HIT_WINDOW_BEATS, PERFECT_FRACTION, SUSTAIN_GRACE_BEATS,
+    NOTE_TOP, HIT_Y, noteY, clampedNoteY,
+    LANE_W, laneOriginX, laneCenterX, colAX, colBX,
+    NOTE_W, NOTE_H, SCRATCH_R, HOLD_TAIL_W,
+    COLOR_A, COLOR_B, COLOR_SCRATCH_CW, COLOR_SCRATCH_CCW, COLOR_SPIN,
+    lerpColor,
 } from "./notes";
 
-// ── Constants ──────────────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
 
 const W = 336;
 const H = 262;
 
-// Turntable geometry
-const TT_CX  = 50;   // center x of platter
-const TT_CY  = 90;   // center y of platter
-const TT_R   = 40;   // outer radius of platter
-const TT_R_INNER = 14; // label circle radius
-
-// Scratch detection thresholds
-const SCRATCH_STEPS_THRESHOLD = 3;   // spinner steps needed per frame burst
-const FLICK_FRAMES_WINDOW     = 12;  // frames in which direction must be held for fallback
-
-// Scoring
+// Scoring (carried over from v1)
 const POINTS_PERFECT = 300;
 const POINTS_GOOD    = 100;
-const LIFE_MISS      = 0.08;
+const LIFE_MISS       = 0.08;
+const LIFE_REGAIN     = 0.012; // slow regain on successful hits
 
-// Lane layout
-const LANE_TOP    = LANE_Y - NOTE_H * 1.6;
-const LANE_BOTTOM = LANE_Y + NOTE_H * 1.6;
-const LANE_RIGHT  = 334;
+// Platter geometry (two platters, one per lane)
+const PLATTER_CY = 226;
+const PLATTER_R  = 19;
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── State ────────────────────────────────────────────────────────────────────
 
 type GameState = "PLAYING" | "RESULT";
 
 interface Judgment { text: string; frame: number; }
 
+interface LaneState {
+    lane: Lane;
+    activeNotes: ActiveNote[];
+    chartIndex: number;
+    gesture: GestureState;
+    platterAngle: number;
+    platterSpeed: number;
+    prevBothHeld: boolean;
+    /** 0..1 — ramps up while a spin note is actively sustaining; tints the whole stream. */
+    tint: number;
+    lastGesture: GestureResult | null;
+    judgments: Judgment[];
+}
+
+const LANE_EVENTS: Record<Lane, NoteEvent[]> = {
+    left:  CHART.filter(e => e.lane === "left"),
+    right: CHART.filter(e => e.lane === "right"),
+};
+
 let ctx: GameContext;
 let p: p5;
 
 let state: GameState = "PLAYING";
-let activeNotes: ActiveNote[] = [];
-let chartIndex    = 0;
-let score         = 0;
-let combo         = 0;
-let life          = 1.0;
-let failed        = false;
-let judgments: Judgment[] = [];
+let score  = 0;
+let combo  = 0;
+let life   = 1.0;
+let failed = false;
 
-// Turntable visual angle (accumulated from spinner/fallback)
-let platterAngle = 0;
+let leftState: LaneState;
+let rightState: LaneState;
 
-// Fallback flick tracking (keyboard/joystick substitute for spinner)
-let flickFrames = 0;
-
-// Direction flick latch (to detect new presses for the fallback)
-let prevLeft  = false;
-let prevRight = false;
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
-
-function pushJudgment(text: string): void {
-    judgments.push({ text, frame: p.frameCount });
+function newLaneState(lane: Lane): LaneState {
+    return {
+        lane,
+        activeNotes: [],
+        chartIndex: 0,
+        gesture: newGestureState(),
+        platterAngle: 0,
+        platterSpeed: 0,
+        prevBothHeld: false,
+        tint: 0,
+        lastGesture: null,
+        judgments: [],
+    };
 }
 
-function registerHit(points: number, quality: string): void {
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function pushJudgment(ls: LaneState, text: string): void {
+    ls.judgments.push({ text, frame: p.frameCount });
+}
+
+function registerHit(ls: LaneState, points: number, label: string): void {
     combo++;
     score += points * combo;
-    pushJudgment(quality);
+    life = Math.min(1, life + LIFE_REGAIN);
+    pushJudgment(ls, label);
 }
 
-function registerMiss(): void {
+function registerMiss(ls: LaneState): void {
     combo = 0;
     life = Math.max(0, life - LIFE_MISS);
-    pushJudgment("MISS");
+    pushJudgment(ls, "MISS");
 }
 
 function resetGame(): void {
-    activeNotes = [];
-    chartIndex  = 0;
-    score       = 0;
-    combo       = 0;
-    life        = 1.0;
-    failed      = false;
-    judgments   = [];
-    platterAngle = 0;
-    flickFrames  = 0;
-    prevLeft     = false;
-    prevRight    = false;
-    state        = "PLAYING";
+    leftState  = newLaneState("left");
+    rightState = newLaneState("right");
+    resetP2Input();
+    score   = 0;
+    combo   = 0;
+    life    = 1.0;
+    failed  = false;
+    state   = "PLAYING";
     void ctx.audio.play(0);
 }
 
-// ── Game logic ─────────────────────────────────────────────────────────────────
+function laneInputFromP1(input: InputSnapshot): LaneInput {
+    return {
+        direction: input.direction,
+        aHeld: input.aHeld,
+        bHeld: input.bHeld,
+        aPressed: input.aPressed,
+        bPressed: input.bPressed,
+        spinnerConnected: input.spinnerConnected,
+        spinnerDelta: input.spinnerDelta,
+    };
+}
 
-function spawnNotes(currentBeat: number): void {
-    while (chartIndex < CHART.length) {
-        const ev = CHART[chartIndex];
+// ── Game logic ───────────────────────────────────────────────────────────────
+
+function spawnNotes(ls: LaneState, currentBeat: number): void {
+    const events = LANE_EVENTS[ls.lane];
+    while (ls.chartIndex < events.length) {
+        const ev = events[ls.chartIndex];
         if (currentBeat >= ev.beat - LOOKAHEAD_BEATS) {
-            activeNotes.push({ event: ev, hit: false, missed: false });
-            chartIndex++;
+            ls.activeNotes.push({ event: ev, result: "pending" });
+            ls.chartIndex++;
         } else break;
     }
 }
 
-/**
- * Determine whether the player has produced a scratch in the given direction
- * this frame. Two input modes:
- *  1. Spinner connected: check spinnerDelta sign + magnitude.
- *  2. Fallback: a LEFT/RIGHT joystick flick that was pressed this frame.
- */
-function detectScratch(input: InputSnapshot, dir: ScratchDir): boolean {
-    if (input.spinnerConnected) {
-        // Positive delta = CW, negative = CCW
-        if (dir === "CW"  && input.spinnerDelta >= SCRATCH_STEPS_THRESHOLD) return true;
-        if (dir === "CCW" && input.spinnerDelta <= -SCRATCH_STEPS_THRESHOLD) return true;
-        return false;
-    }
-    // Fallback: a new flick in the correct direction
-    if (dir === "CW"  && input.direction === "RIGHT" && !prevRight) return true;
-    if (dir === "CCW" && input.direction === "LEFT"  && !prevLeft)  return true;
-    return false;
+function applyHit(ls: LaneState, note: ActiveNote, beatDiff: number): void {
+    const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * PERFECT_FRACTION;
+    note.result = "hit";
+    registerHit(ls, perfect ? POINTS_PERFECT : POINTS_GOOD, perfect ? "PERFECT" : "GOOD");
 }
 
-function evaluateNotes(currentBeat: number, input: InputSnapshot): void {
-    for (const note of activeNotes) {
-        if (note.hit || note.missed) continue;
-        const { event: ev } = note;
-        const beatDiff = currentBeat - ev.beat;
+function applyMiss(ls: LaneState, note: ActiveNote): void {
+    note.result = "missed";
+    registerMiss(ls);
+}
 
-        if (ev.type === "hit") {
-            const btn = ev.button ?? "A";
-            const pressed = btn === "A" ? input.aPressed : input.bPressed;
-            if (pressed && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
-                const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * 0.55;
-                registerHit(perfect ? POINTS_PERFECT : POINTS_GOOD, perfect ? "PERFECT" : "GOOD");
-                note.hit = true;
-            } else if (beatDiff > HIT_WINDOW_BEATS) {
-                registerMiss();
-                note.missed = true;
-            }
-        } else {
-            // scratch note
-            const dir = ev.scratch ?? "CW";
-            const scratched = detectScratch(input, dir);
-            if (scratched && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
-                const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * 0.55;
-                registerHit(perfect ? POINTS_PERFECT : POINTS_GOOD, perfect ? "PERFECT!" : "GOOD");
-                note.hit = true;
-            } else if (beatDiff > HIT_WINDOW_BEATS) {
-                registerMiss();
-                note.missed = true;
+/** Shared all-or-nothing sustain judging for hold/spin notes. */
+function evaluateSustain(ls: LaneState, note: ActiveNote, currentBeat: number, beatDiff: number, engaged: boolean): void {
+    const ev = note.event;
+    const endBeat = ev.beat + (ev.durationBeats ?? 0);
+
+    if (!note.sustain || note.sustain === "idle") {
+        if (engaged && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
+            const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * PERFECT_FRACTION;
+            note.entryGrade = perfect ? "PERFECT" : "GOOD";
+            note.sustain = "active";
+        } else if (beatDiff > HIT_WINDOW_BEATS) {
+            note.sustain = "failed";
+            note.result = "missed";
+            registerMiss(ls);
+        }
+        return;
+    }
+
+    if (note.sustain === "active") {
+        if (currentBeat >= endBeat) {
+            completeSustain(ls, note);
+        } else if (!engaged) {
+            if (currentBeat >= endBeat - SUSTAIN_GRACE_BEATS) completeSustain(ls, note);
+            else {
+                note.sustain = "failed";
+                note.result = "missed";
+                registerMiss(ls);
             }
         }
     }
-
-    // Cull stale notes
-    activeNotes = activeNotes.filter(n => currentBeat - n.event.beat < LOOKAHEAD_BEATS + 1);
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────────────
+function completeSustain(ls: LaneState, note: ActiveNote): void {
+    note.sustain = "done";
+    note.result = "hit";
+    const grade = note.entryGrade ?? "GOOD";
+    registerHit(ls, grade === "PERFECT" ? POINTS_PERFECT : POINTS_GOOD, grade);
+}
+
+/** Brief synthesized scratch blip — no audio asset needed, built on the shared AudioContext. */
+function triggerScratchFX(dir: ScratchDir): void {
+    const audioCtx = ctx.audio.context;
+    const now = audioCtx.currentTime;
+    const osc  = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sawtooth";
+    const startFreq = dir === "CW" ? 480 : 360;
+    const endFreq   = dir === "CW" ? 130 : 620;
+    osc.frequency.setValueAtTime(startFreq, now);
+    osc.frequency.exponentialRampToValueAtTime(endFreq, now + 0.09);
+    gain.gain.setValueAtTime(0.16, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.12);
+}
+
+function evaluateLane(ls: LaneState, currentBeat: number, laneInput: LaneInput, nowMs: number): void {
+    const gr = sampleGesture(ls.gesture, laneInput, nowMs, currentBeat, SUSTAIN_GRACE_BEATS);
+    ls.lastGesture = gr;
+
+    const bothHeldNow = laneInput.aHeld && laneInput.bHeld;
+    const doubleEdge = bothHeldNow && !ls.prevBothHeld;
+    ls.prevBothHeld = bothHeldNow;
+
+    let spinActive = false;
+
+    for (const note of ls.activeNotes) {
+        const ev = note.event;
+        if (note.result !== "pending") continue;
+        const beatDiff = currentBeat - ev.beat;
+
+        switch (ev.kind) {
+            case "tap": {
+                const pressed = ev.button === "B" ? laneInput.bPressed : laneInput.aPressed;
+                if (pressed && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) applyHit(ls, note, beatDiff);
+                else if (beatDiff > HIT_WINDOW_BEATS) applyMiss(ls, note);
+                break;
+            }
+            case "double": {
+                if (doubleEdge && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) applyHit(ls, note, beatDiff);
+                else if (beatDiff > HIT_WINDOW_BEATS) applyMiss(ls, note);
+                break;
+            }
+            case "scratch": {
+                const dir = ev.scratch ?? "CW";
+                const triggered = dir === "CW" ? gr.scratchCW : gr.scratchCCW;
+                if (triggered && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
+                    applyHit(ls, note, beatDiff);
+                    triggerScratchFX(dir);
+                } else if (beatDiff > HIT_WINDOW_BEATS) applyMiss(ls, note);
+                break;
+            }
+            case "hold": {
+                const engaged = ev.button === "B" ? laneInput.bHeld : laneInput.aHeld;
+                evaluateSustain(ls, note, currentBeat, beatDiff, engaged);
+                break;
+            }
+            case "spin": {
+                evaluateSustain(ls, note, currentBeat, beatDiff, gr.spinning);
+                break;
+            }
+        }
+
+        if (ev.kind === "spin" && note.sustain === "active") spinActive = true;
+    }
+
+    // Lane coloring: ramp the whole stream's tint toward COLOR_SPIN while a spin note sustains.
+    const tintTarget = spinActive ? 1 : 0;
+    ls.tint += (tintTarget - ls.tint) * 0.15;
+
+    // Platter momentum: smoothly chase the gesture drive so it visibly slows down, not snaps to 0.
+    const drive = gr.visualDelta * 0.02;
+    ls.platterSpeed += (drive - ls.platterSpeed) * 0.25;
+    ls.platterAngle += ls.platterSpeed;
+
+    // Cull stale notes.
+    ls.activeNotes = ls.activeNotes.filter(n => {
+        const endBeat = n.event.beat + (n.event.durationBeats ?? 0);
+        return currentBeat - endBeat < 1.5;
+    });
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────────
 
 function drawBackground(): void {
     p.background(10, 8, 20);
-
-    // Subtle grid lines
-    p.stroke(30, 25, 50);
+    p.stroke(28, 24, 46);
     p.strokeWeight(0.5);
-    for (let x = 0; x < W; x += 24) {
-        p.line(x, 0, x, H);
-    }
-    for (let y = 0; y < H; y += 24) {
-        p.line(0, y, W, y);
-    }
-}
+    for (let x = 0; x < W; x += 24) p.line(x, 0, x, H);
+    for (let y = 0; y < H; y += 24) p.line(0, y, W, y);
 
-/** Draw the spinning platter + tonearm. */
-function drawTurntable(input: InputSnapshot): void {
-    // Update platter rotation
-    if (input.spinnerConnected) {
-        // spinnerDelta is steps; convert to radians (roughly 2π / 360 steps per rev)
-        platterAngle += input.spinnerDelta * (Math.PI * 2 / 360);
-    } else {
-        // Fallback: animate slowly by direction
-        if (input.direction === "LEFT")  platterAngle -= 0.04;
-        if (input.direction === "RIGHT") platterAngle += 0.04;
-    }
-
-    const cx = TT_CX;
-    const cy = TT_CY;
-    const r  = TT_R;
-
-    // Shadow
-    p.noStroke();
-    p.fill(5, 4, 12, 180);
-    p.ellipse(cx + 3, cy + 3, r * 2 + 4, r * 2 + 4);
-
-    // Outer rim
-    p.stroke(80, 70, 110);
-    p.strokeWeight(3);
-    p.fill(18, 14, 30);
-    p.ellipse(cx, cy, r * 2, r * 2);
-
-    // Grooves (concentric rings on the platter, rotated)
-    p.noFill();
-    p.strokeWeight(0.5);
-    for (let gr = 8; gr < r - 4; gr += 5) {
-        const alpha = p.map(gr, 8, r - 4, 30, 80);
-        p.stroke(70, 60, 100, alpha);
-        p.ellipse(cx, cy, gr * 2, gr * 2);
-    }
-
-    // Platter rotation indicator line (like a groove start mark)
-    const lx = cx + Math.cos(platterAngle) * (r - 5);
-    const ly = cy + Math.sin(platterAngle) * (r - 5);
-    p.stroke(140, 110, 200, 180);
-    p.strokeWeight(1.5);
-    p.line(cx, cy, lx, ly);
-
-    // Center label circle
+    // Center divider between the two lanes
+    p.stroke(50, 42, 80);
     p.strokeWeight(1);
-    p.stroke(60, 50, 90);
-    p.fill(40, 30, 65);
-    p.ellipse(cx, cy, TT_R_INNER * 2, TT_R_INNER * 2);
-
-    // Label text
-    p.noStroke();
-    p.fill(160, 140, 200);
-    p.textAlign(p.CENTER, p.CENTER);
-    p.textSize(6);
-    p.text("DJ", cx, cy - 3);
-    p.text("RCADE", cx, cy + 4);
-
-    // Spindle pin
-    p.fill(200, 190, 220);
-    p.noStroke();
-    p.ellipse(cx, cy, 4, 4);
-
-    // Tonearm
-    const armBaseX = cx + r + 8;
-    const armBaseY = cy - r + 4;
-    const armAngle = -0.6 + (platterAngle * 0.005 % 0.4);  // slight drift
-    const armLen   = 28;
-    const armTipX  = armBaseX + Math.cos(armAngle + Math.PI) * armLen;
-    const armTipY  = armBaseY + Math.sin(armAngle + Math.PI) * armLen;
-
-    p.stroke(150, 140, 170);
-    p.strokeWeight(2);
-    p.line(armBaseX, armBaseY, armTipX, armTipY);
-    p.fill(180, 160, 200);
-    p.noStroke();
-    p.ellipse(armBaseX, armBaseY, 6, 6);
-    p.ellipse(armTipX, armTipY, 3, 3);
-
-    // Spinner connected indicator
-    p.textAlign(p.LEFT, p.BOTTOM);
-    p.textSize(6);
-    p.noStroke();
-    p.fill(input.spinnerConnected ? 80 : 60, input.spinnerConnected ? 200 : 60, 100);
-    p.text(input.spinnerConnected ? "SPIN" : "KEYS", 8, H - 4);
+    p.line(W / 2, NOTE_TOP - 8, W / 2, HIT_Y + 6);
 }
 
-function drawLane(currentBeat: number): void {
-    // Lane background
-    p.noStroke();
-    p.fill(18, 14, 32);
-    p.rect(HIT_X - 5, LANE_TOP, LANE_RIGHT - HIT_X + 10, LANE_BOTTOM - LANE_TOP, 3);
+function tintedColor(base: RGB, tint: number): RGB {
+    return lerpColor(base, COLOR_SPIN, tint * 0.6);
+}
 
-    // Beat tick marks
+function drawLanePanel(ls: LaneState, currentBeat: number): void {
+    const x0 = laneOriginX(ls.lane);
+    const bg = lerpColor([18, 14, 32], [46, 20, 58], ls.tint);
+
+    p.noStroke();
+    p.fill(bg[0], bg[1], bg[2]);
+    p.rect(x0, NOTE_TOP - 6, LANE_W, HIT_Y - NOTE_TOP + 12, 3);
+
     p.stroke(40, 35, 65);
     p.strokeWeight(0.5);
     const startBeat = Math.floor(currentBeat);
     for (let b = startBeat; b <= currentBeat + LOOKAHEAD_BEATS + 1; b++) {
-        const x = noteX(b, currentBeat);
-        if (x >= HIT_X - 2 && x <= LANE_RIGHT) {
-            p.line(x, LANE_TOP, x, LANE_BOTTOM);
-        }
+        const y = noteY(b, currentBeat);
+        if (y >= NOTE_TOP - 2 && y <= HIT_Y) p.line(x0, y, x0 + LANE_W, y);
     }
 
-    // Hit line
-    p.stroke(160, 130, 240);
+    const hit = lerpColor([160, 130, 240], COLOR_SPIN, ls.tint);
+    p.stroke(hit[0], hit[1], hit[2]);
     p.strokeWeight(2);
-    p.line(HIT_X, LANE_TOP - 4, HIT_X, LANE_BOTTOM + 4);
-
-    // Hit zone glow
+    p.line(x0 - 2, HIT_Y, x0 + LANE_W + 2, HIT_Y);
     p.noFill();
-    p.stroke(160, 130, 240, 40);
-    p.strokeWeight(8);
-    p.line(HIT_X, LANE_TOP - 4, HIT_X, LANE_BOTTOM + 4);
+    p.stroke(hit[0], hit[1], hit[2], 40);
+    p.strokeWeight(7);
+    p.line(x0 - 2, HIT_Y, x0 + LANE_W + 2, HIT_Y);
 }
 
-function drawNotes(currentBeat: number): void {
-    for (const note of activeNotes) {
-        if (note.missed) continue;
-        const { event: ev } = note;
-        const x = noteX(ev.beat, currentBeat);
-        if (x < HIT_X - NOTE_W * 2 || x > LANE_RIGHT + NOTE_W) continue;
-
-        const cx = p.constrain(x, HIT_X, LANE_RIGHT);
-        const cy = LANE_Y;
-
-        if (ev.type === "hit") {
-            if (note.hit) continue;
-            const [r, g, b_] = ev.button === "B" ? COLOR_HIT_B : COLOR_HIT_A;
-            // Draw a pill/rectangle
-            p.fill(r, g, b_);
-            p.stroke(255, 255, 255, 160);
-            p.strokeWeight(1.5);
-            p.rect(cx - NOTE_W / 2, cy - NOTE_H / 2, NOTE_W, NOTE_H, 4);
-            // Button label
-            p.noStroke();
-            p.fill(10, 8, 20);
-            p.textAlign(p.CENTER, p.CENTER);
-            p.textSize(8);
-            p.text(ev.button ?? "A", cx, cy);
-        } else {
-            // scratch note
-            const dir = ev.scratch ?? "CW";
-            const [r, g, b_] = dir === "CW" ? COLOR_SCRATCH_CW : COLOR_SCRATCH_CCW;
-            p.fill(r, g, b_, note.hit ? 80 : 220);
-            p.stroke(255, 255, 255, 120);
-            p.strokeWeight(1.5);
-            p.ellipse(cx, cy, NOTE_W + 4, NOTE_W + 4);
-
-            if (!note.hit) {
-                // Arrow indicating direction
-                p.noStroke();
-                p.fill(10, 8, 20);
-                drawArrow(cx, cy, dir);
-            }
-        }
-    }
-}
-
-/** Draw a small CW or CCW arrow inside a scratch note circle. */
+/** Small CW/CCW arrow drawn inside a scratch note. */
 function drawArrow(cx: number, cy: number, dir: ScratchDir): void {
     const r = 5;
-    // Draw arc stub + arrowhead
     p.noFill();
     p.stroke(10, 8, 20);
     p.strokeWeight(1.5);
     if (dir === "CW") {
-        // Arc from left to bottom (clockwise)
         p.arc(cx, cy, r * 2, r * 2, Math.PI, Math.PI * 1.8);
-        // Arrowhead at end of arc (pointing down-right for CW)
         p.fill(10, 8, 20);
         p.noStroke();
-        p.triangle(
-            cx + r * 0.6, cy + r * 0.8,
-            cx + r * 1.1, cy + r * 0.2,
-            cx + r * 0.0, cy + r * 0.5,
-        );
+        p.triangle(cx + r * 0.6, cy + r * 0.8, cx + r * 1.1, cy + r * 0.2, cx + r * 0.0, cy + r * 0.5);
     } else {
-        // Arc from right to bottom (counter-clockwise)
         p.arc(cx, cy, r * 2, r * 2, -Math.PI * 0.2, 0);
         p.fill(10, 8, 20);
         p.noStroke();
-        p.triangle(
-            cx - r * 0.6, cy + r * 0.8,
-            cx - r * 1.1, cy + r * 0.2,
-            cx - r * 0.0, cy + r * 0.5,
-        );
+        p.triangle(cx - r * 0.6, cy + r * 0.8, cx - r * 1.1, cy + r * 0.2, cx - r * 0.0, cy + r * 0.5);
+    }
+}
+
+function drawTapNote(ev: NoteEvent, currentBeat: number, aX: number, bX: number, tint: number): void {
+    const y = clampedNoteY(ev.beat, currentBeat);
+    if (y < NOTE_TOP - NOTE_H || y > HIT_Y + NOTE_H) return;
+    const x = ev.button === "B" ? bX : aX;
+    const [r, g, b] = tintedColor(ev.button === "B" ? COLOR_B : COLOR_A, tint);
+    p.fill(r, g, b);
+    p.stroke(255, 255, 255, 160);
+    p.strokeWeight(1.5);
+    p.rect(x - NOTE_W / 2, y - NOTE_H / 2, NOTE_W, NOTE_H, 4);
+    p.noStroke();
+    p.fill(10, 8, 20);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(7);
+    p.text(ev.button ?? "A", x, y);
+}
+
+function drawHoldNote(ev: NoteEvent, note: ActiveNote, currentBeat: number, aX: number, bX: number, tint: number): void {
+    const duration = ev.durationBeats ?? 0;
+    const headY = clampedNoteY(ev.beat, currentBeat);
+    const tailY = clampedNoteY(ev.beat + duration, currentBeat);
+    if (tailY > HIT_Y + NOTE_H && headY > HIT_Y + NOTE_H) return;
+    const x = ev.button === "B" ? bX : aX;
+    const [r, g, b] = tintedColor(ev.button === "B" ? COLOR_B : COLOR_A, tint);
+    const active = note.sustain === "active";
+
+    p.noStroke();
+    p.fill(r, g, b, active ? 170 : 110);
+    p.rect(x - HOLD_TAIL_W / 2, tailY, HOLD_TAIL_W, Math.max(0, headY - tailY), 3);
+
+    p.fill(r, g, b);
+    p.stroke(255, 255, 255, active ? 230 : 140);
+    p.strokeWeight(1.5);
+    p.rect(x - NOTE_W / 2, headY - NOTE_H / 2, NOTE_W, NOTE_H, 4);
+    p.noStroke();
+    p.fill(10, 8, 20);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(7);
+    p.text(ev.button ?? "A", x, headY);
+}
+
+function drawDoubleNote(ev: NoteEvent, currentBeat: number, aX: number, bX: number, tint: number): void {
+    const y = clampedNoteY(ev.beat, currentBeat);
+    if (y < NOTE_TOP - NOTE_H || y > HIT_Y + NOTE_H) return;
+    const left  = aX - NOTE_W / 2;
+    const right = bX + NOTE_W / 2;
+    const midX  = (left + right) / 2;
+    const [ra, ga, ba] = tintedColor(COLOR_A, tint);
+    const [rb, gb, bb] = tintedColor(COLOR_B, tint);
+
+    p.noStroke();
+    p.fill(ra, ga, ba);
+    p.rect(left, y - NOTE_H / 2, midX - left, NOTE_H, 4, 0, 0, 4);
+    p.fill(rb, gb, bb);
+    p.rect(midX, y - NOTE_H / 2, right - midX, NOTE_H, 0, 4, 4, 0);
+
+    p.noFill();
+    p.stroke(255, 255, 255, 180);
+    p.strokeWeight(1.5);
+    p.rect(left, y - NOTE_H / 2, right - left, NOTE_H, 4);
+
+    p.noStroke();
+    p.fill(10, 8, 20);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(6.5);
+    p.text("A+B", midX, y);
+}
+
+function drawScratchNote(ev: NoteEvent, currentBeat: number, cX: number): void {
+    const y = clampedNoteY(ev.beat, currentBeat);
+    if (y < NOTE_TOP - SCRATCH_R || y > HIT_Y + SCRATCH_R) return;
+    const dir = ev.scratch ?? "CW";
+    const [r, g, b] = dir === "CW" ? COLOR_SCRATCH_CW : COLOR_SCRATCH_CCW;
+    p.fill(r, g, b, 220);
+    p.stroke(255, 255, 255, 140);
+    p.strokeWeight(1.5);
+    p.ellipse(cX, y, SCRATCH_R * 2, SCRATCH_R * 2);
+    p.noStroke();
+    p.fill(10, 8, 20);
+    drawArrow(cX, y, dir);
+}
+
+function drawSpinNote(ev: NoteEvent, note: ActiveNote, currentBeat: number, cX: number, health: number): void {
+    const duration = ev.durationBeats ?? 0;
+    const headY = clampedNoteY(ev.beat, currentBeat);
+    const tailY = clampedNoteY(ev.beat + duration, currentBeat);
+    const active = note.sustain === "active";
+    const warn = active && health < 0.5;
+
+    p.noStroke();
+    p.fill(COLOR_SPIN[0], COLOR_SPIN[1], COLOR_SPIN[2], active ? 130 : 90);
+    p.rect(cX - SCRATCH_R, tailY, SCRATCH_R * 2, Math.max(0, headY - tailY), 4);
+
+    const headColor: RGB = warn ? [230, 70, 70] : COLOR_SPIN;
+    p.fill(headColor[0], headColor[1], headColor[2], 230);
+    p.stroke(255, 255, 255, 180);
+    p.strokeWeight(1.5);
+    p.ellipse(cX, headY, SCRATCH_R * 2, SCRATCH_R * 2);
+
+    // Rotating spokes suggest "keep spinning"; they visibly slow as `health` drops.
+    p.stroke(10, 8, 20);
+    p.strokeWeight(1.5);
+    const spinRate = active ? 0.5 + health * 3.5 : 4;
+    const spokeAngle = (currentBeat * spinRate) % (Math.PI * 2);
+    for (let i = 0; i < 3; i++) {
+        const a = spokeAngle + i * ((Math.PI * 2) / 3);
+        p.line(cX, headY, cX + Math.cos(a) * SCRATCH_R * 0.65, headY + Math.sin(a) * SCRATCH_R * 0.65);
+    }
+}
+
+function drawNotes(ls: LaneState, currentBeat: number): void {
+    const aX = colAX(ls.lane);
+    const bX = colBX(ls.lane);
+    const cX = laneCenterX(ls.lane);
+    const health = ls.lastGesture?.spinHealth ?? 1;
+
+    for (const note of ls.activeNotes) {
+        if (note.result !== "pending") continue;
+        const ev = note.event;
+        switch (ev.kind) {
+            case "tap":     drawTapNote(ev, currentBeat, aX, bX, ls.tint); break;
+            case "hold":    drawHoldNote(ev, note, currentBeat, aX, bX, ls.tint); break;
+            case "double":  drawDoubleNote(ev, currentBeat, aX, bX, ls.tint); break;
+            case "scratch": drawScratchNote(ev, currentBeat, cX); break;
+            case "spin":    drawSpinNote(ev, note, currentBeat, cX, health); break;
+        }
+    }
+}
+
+function drawPlatter(ls: LaneState, laneInput: LaneInput): void {
+    const cx = laneCenterX(ls.lane);
+    const cy = PLATTER_CY;
+    const r  = PLATTER_R;
+
+    p.noStroke();
+    p.fill(5, 4, 12, 180);
+    p.ellipse(cx + 2, cy + 2, r * 2 + 3, r * 2 + 3);
+
+    const rim = lerpColor([80, 70, 110], COLOR_SPIN, ls.tint);
+    p.stroke(rim[0], rim[1], rim[2]);
+    p.strokeWeight(2.5);
+    p.fill(18, 14, 30);
+    p.ellipse(cx, cy, r * 2, r * 2);
+
+    p.noFill();
+    p.strokeWeight(0.5);
+    for (let gr = 6; gr < r - 3; gr += 4) {
+        const alpha = p.map(gr, 6, r - 3, 25, 70);
+        p.stroke(70, 60, 100, alpha);
+        p.ellipse(cx, cy, gr * 2, gr * 2);
+    }
+
+    const lx = cx + Math.cos(ls.platterAngle) * (r - 4);
+    const ly = cy + Math.sin(ls.platterAngle) * (r - 4);
+    p.stroke(150, 120, 210, 200);
+    p.strokeWeight(1.5);
+    p.line(cx, cy, lx, ly);
+
+    p.noStroke();
+    p.fill(200, 190, 220);
+    p.ellipse(cx, cy, 3, 3);
+
+    p.textAlign(p.CENTER, p.TOP);
+    p.textSize(5.5);
+    p.fill(laneInput.spinnerConnected ? 90 : 60, laneInput.spinnerConnected ? 210 : 60, 110);
+    p.text(laneInput.spinnerConnected ? "SPIN" : "KEYS", cx, cy + r + 2);
+}
+
+function drawJudgments(ls: LaneState): void {
+    ls.judgments = ls.judgments.filter(j => p.frameCount - j.frame < 40);
+    const cx = laneCenterX(ls.lane);
+    for (const j of ls.judgments) {
+        const age = p.frameCount - j.frame;
+        const alpha = p.map(age, 16, 40, 255, 0);
+        const dy    = p.map(age, 0, 40, 0, -12);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.textSize(10);
+        p.noStroke();
+        if (j.text.startsWith("PERFECT"))  p.fill(255, 240, 80, alpha);
+        else if (j.text === "GOOD")         p.fill(80, 220, 120, alpha);
+        else                                p.fill(255, 80, 80, alpha);
+        p.text(j.text, cx, NOTE_TOP + 10 + dy);
     }
 }
 
 function drawHUD(currentBeat: number): void {
-    // Score (top right)
     p.noStroke();
     p.fill(200, 195, 220);
     p.textAlign(p.RIGHT, p.TOP);
     p.textSize(9);
-    p.text(score.toString().padStart(7, "0"), W - 4, 4);
+    p.text(score.toString().padStart(7, "0"), W - 4, 2);
 
-    // Combo (top left, beside turntable area)
     if (combo > 1) {
         p.textAlign(p.LEFT, p.TOP);
         p.textSize(9);
         p.fill(180, 160, 220);
-        p.text(`${combo}×`, 4, 4);
+        p.text(`${combo}×`, 4, 2);
     }
 
-    // Life bar (below lane)
-    const barY  = LANE_BOTTOM + 8;
-    const barX  = HIT_X;
-    const barW  = LANE_RIGHT - HIT_X;
+    // Life bar spans both lanes
+    const barX = laneOriginX("left");
+    const barW = laneOriginX("right") + LANE_W - barX;
+    const barY = PLATTER_CY + PLATTER_R + 6;
     p.fill(35, 28, 55);
     p.rect(barX, barY, barW, 5, 2);
-    const lc = life > 0.5
-        ? p.color(80, 200, 120)
-        : life > 0.25
-            ? p.color(230, 180, 40)
-            : p.color(220, 60, 60);
+    const lc = life > 0.5 ? p.color(80, 200, 120) : life > 0.25 ? p.color(230, 180, 40) : p.color(220, 60, 60);
     p.fill(lc);
     p.rect(barX, barY, barW * life, 5, 2);
-
-    // "LIFE" label
     p.noStroke();
     p.fill(100, 90, 130);
     p.textAlign(p.LEFT, p.BASELINE);
     p.textSize(6);
     p.text("LIFE", barX, barY - 1);
 
-    // Beat counter (bottom right)
     p.textAlign(p.RIGHT, p.BOTTOM);
     p.textSize(7);
     p.fill(80, 75, 110);
-    p.text(`♩${Math.floor(currentBeat)}`, W - 4, H - 4);
+    p.text(`♪${Math.floor(currentBeat)}`, W - 4, H - 3);
 
-    // Judgment text (centered over lane)
-    judgments = judgments.filter(j => p.frameCount - j.frame < 45);
-    for (const j of judgments) {
-        const age = p.frameCount - j.frame;
-        const alpha = p.map(age, 20, 45, 255, 0);
-        const dy    = p.map(age, 0, 45, 0, -14);
-        p.textAlign(p.CENTER, p.CENTER);
-        p.textSize(12);
-        if (j.text.startsWith("PERFECT"))  p.fill(255, 240, 80, alpha);
-        else if (j.text === "GOOD")         p.fill(80, 220, 120, alpha);
-        else                                p.fill(255, 80, 80, alpha);
-        p.text(j.text, HIT_X + 80, LANE_Y - 30 + dy);
-    }
-
-    // Hint (if within first 5 beats)
     if (currentBeat < 5) {
         p.textAlign(p.CENTER, p.BOTTOM);
-        p.textSize(7);
+        p.textSize(6.5);
         p.fill(100, 90, 130, 200);
-        p.text("A/B = tap   SPIN or LEFT/RIGHT = scratch", W / 2, LANE_TOP - 5);
+        p.text("A/B=tap  hold=sustain  A+B=double  SPIN/L-R=scratch,hold=spin", W / 2, H - 12);
     }
+
+    drawJudgments(leftState);
+    drawJudgments(rightState);
 }
 
-function drawScratchIndicator(input: InputSnapshot): void {
-    // Show current spinner activity as an animated glow on the hit line
-    const mag = input.spinnerConnected
-        ? Math.abs(input.spinnerDelta)
-        : (input.direction === "LEFT" || input.direction === "RIGHT" ? 4 : 0);
-    if (mag < 1) return;
-    const alpha = p.map(mag, 1, 8, 60, 200);
-    const col   = input.spinnerDelta >= 0 ? COLOR_SCRATCH_CW : COLOR_SCRATCH_CCW;
-    p.noFill();
-    p.stroke(col[0], col[1], col[2], alpha);
-    p.strokeWeight(6);
-    p.line(HIT_X, LANE_TOP - 6, HIT_X, LANE_BOTTOM + 6);
-}
-
-// ── Screen: PLAYING ────────────────────────────────────────────────────────────
+// ── Screen: PLAYING ──────────────────────────────────────────────────────────
 
 function framePlaying(input: InputSnapshot): void {
     const cb = ctx.beatNow();
+    const nowMs = p.millis();
 
-    // Update fallback flick state (must run before evaluateNotes)
-    const leftNow  = input.direction === "LEFT";
-    const rightNow = input.direction === "RIGHT";
-    if (leftNow && !prevLeft)   { flickFrames = FLICK_FRAMES_WINDOW; }
-    if (rightNow && !prevRight) { flickFrames = FLICK_FRAMES_WINDOW; }
-    if (flickFrames > 0) flickFrames--;
-    prevLeft  = leftNow;
-    prevRight = rightNow;
+    const p1Lane = laneInputFromP1(input);
+    const p2Lane = sampleP2();
 
-    // Game logic
-    spawnNotes(cb);
-    evaluateNotes(cb, input);
+    spawnNotes(leftState, cb);
+    spawnNotes(rightState, cb);
+    evaluateLane(leftState, cb, p1Lane, nowMs);
+    evaluateLane(rightState, cb, p2Lane, nowMs);
 
-    // Draw
     drawBackground();
-    drawTurntable(input);
-    drawLane(cb);
-    drawNotes(cb);
-    drawScratchIndicator(input);
+    drawLanePanel(leftState, cb);
+    drawLanePanel(rightState, cb);
+    drawNotes(leftState, cb);
+    drawNotes(rightState, cb);
+    drawPlatter(leftState, p1Lane);
+    drawPlatter(rightState, p2Lane);
     drawHUD(cb);
 
-    // Life out = fail
     if (life <= 0 && !failed) {
         failed = true;
         ctx.audio.stop();
@@ -498,7 +609,7 @@ function framePlaying(input: InputSnapshot): void {
     }
 }
 
-// ── Screen: RESULT ─────────────────────────────────────────────────────────────
+// ── Screen: RESULT ───────────────────────────────────────────────────────────
 
 function frameResult(input: InputSnapshot): void {
     drawBackground();
@@ -506,7 +617,6 @@ function frameResult(input: InputSnapshot): void {
     const cx = W / 2;
     const cy = H / 2;
 
-    // Panel
     p.noStroke();
     p.fill(25, 20, 45);
     p.rect(cx - 100, cy - 55, 200, 110, 8);
@@ -518,17 +628,14 @@ function frameResult(input: InputSnapshot): void {
     p.noStroke();
     p.textAlign(p.CENTER, p.CENTER);
 
-    // Result title
     p.textSize(22);
     p.fill(failed ? 220 : 100, failed ? 60 : 230, failed ? 60 : 120);
     p.text(failed ? "FAIL" : "CLEAR!", cx, cy - 30);
 
-    // Score
     p.textSize(13);
     p.fill(220, 210, 255);
     p.text(`SCORE  ${score.toString().padStart(7, "0")}`, cx, cy + 2);
 
-    // Grade
     const grade =
         score > 50000 ? "S" :
         score > 30000 ? "A" :
@@ -538,7 +645,6 @@ function frameResult(input: InputSnapshot): void {
     p.fill(255, 240, 80);
     p.text(grade, cx, cy + 26);
 
-    // Prompt
     p.textSize(8);
     p.fill(110, 100, 140);
     p.text("A to replay   ·   hold START to exit", cx, cy + 50);
@@ -546,7 +652,7 @@ function frameResult(input: InputSnapshot): void {
     if (input.aPressed) resetGame();
 }
 
-// ── Module ─────────────────────────────────────────────────────────────────────
+// ── Module ───────────────────────────────────────────────────────────────────
 
 const dj: GameModule = {
     id: "dj",
@@ -567,8 +673,12 @@ const dj: GameModule = {
     },
 
     teardown(): void {
-        activeNotes = [];
-        judgments   = [];
+        leftState.activeNotes = [];
+        leftState.judgments = [];
+        rightState.activeNotes = [];
+        rightState.judgments = [];
+        resetGestureState(leftState.gesture);
+        resetGestureState(rightState.gesture);
         ctx.audio.stop();
     },
 };

@@ -1,234 +1,208 @@
-// DJ chart for the shared song (vendored).
-// Mixes hit notes (tap A/B) with scratch notes (CW/CCW on spinner).
-// All timings are in beats of the shared song (platform/song.ts).
+// DJ chart for the shared song (v2, vendored).
 //
-// Song structure:
-//   beats   1–115  : 108 BPM opening
-//   beats 115–212  : 126.6 BPM mid
-//   beats 212–276  : 86.3 BPM finale
+// Two independent lane streams — left (P1) and right (P2) — authored as two
+// parts of one arrangement. Each lane showcases all five verbs (tap, hold,
+// double, scratch, spin). Two-hand rule: within a single lane, a buttons-group
+// event (tap/hold/double) never temporally overlaps a spinner-group event
+// (scratch/spin) — one hand can't do both at once. Across lanes, simultaneous
+// action is the point (that's the two-lane design), so left/right timings
+// freely overlap each other.
+//
+// Song structure (see platform/song.ts):
+//   beats   0–115.6 : 108.0 BPM opening
+//   beats 115.6–212.5: 126.6 BPM mid
+//   beats 212.5–276 : 86.3 BPM finale
 
-import type { NoteEvent } from "./notes";
+import type { NoteEvent, Lane, Button, ScratchDir } from "./notes";
+import { HIT_WINDOW_BEATS } from "./notes";
+
+const tap    = (lane: Lane, beat: number, button: Button): NoteEvent => ({ lane, beat, kind: "tap", button });
+const hold   = (lane: Lane, beat: number, button: Button, durationBeats: number): NoteEvent =>
+    ({ lane, beat, kind: "hold", button, durationBeats });
+const dbl    = (lane: Lane, beat: number): NoteEvent => ({ lane, beat, kind: "double" });
+const sc     = (lane: Lane, beat: number, dir: ScratchDir): NoteEvent => ({ lane, beat, kind: "scratch", scratch: dir });
+const spin   = (lane: Lane, beat: number, durationBeats: number): NoteEvent => ({ lane, beat, kind: "spin", durationBeats });
 
 const A = "A" as const;
 const B = "B" as const;
 const CW  = "CW"  as const;
 const CCW = "CCW" as const;
 
-const hit = (beat: number, btn: "A" | "B"): NoteEvent =>
-    ({ beat, type: "hit", button: btn });
+// ── Left lane (P1) ───────────────────────────────────────────────────────────
 
-const sc = (beat: number, dir: "CW" | "CCW"): NoteEvent =>
-    ({ beat, type: "scratch", scratch: dir });
-
-// ── Section 1: 108 BPM (beats 1–115) ─────────────────────────────────────────
-// Intro: quarter-beat hits to let the player find the groove
-const SECTION_1: NoteEvent[] = [
-    hit(3,  A),
-    hit(5,  A),
-    hit(7,  A),
-    hit(9,  A),
-
-    // First scratches: alternating CW/CCW every 2 beats
-    sc (11, CW),
-    sc (13, CCW),
-    sc (15, CW),
-    sc (17, CCW),
-
-    // Hit + scratch combos
-    hit(19, A),  sc (20, CW),
-    hit(21, B),  sc (22, CCW),
-    hit(23, A),  sc (24, CW),
-    hit(25, B),  sc (26, CCW),
-
-    // Burst: quick triple hits
-    hit(27, A), hit(27.5, B), hit(28, A),
-    sc (29, CW),
-
-    hit(31, A), hit(31.5, B), hit(32, A),
-    sc (33, CCW),
-
-    // Scratch run
-    sc (35, CW),
-    sc (36, CCW),
-    sc (37, CW),
-    sc (38, CCW),
-
-    hit(39, A),  hit(40, B),
-
-    // Dense section — every beat
-    hit(41, A), sc (42, CW),
-    hit(43, B), sc (44, CCW),
-    hit(45, A), sc (46, CW),
-    hit(47, B), sc (48, CCW),
-
-    // Eighth-note alternation
-    hit(49, A), hit(49.5, B), sc(50, CW),
-    hit(51, A), hit(51.5, B), sc(52, CCW),
-    hit(53, A), hit(53.5, B), sc(54, CW),
-
-    // Scratch triplets
-    sc (55, CW),  sc (55.5, CCW), sc (56,   CW),
-    sc (57, CCW), sc (57.5, CW),  sc (58,   CCW),
-
-    hit(59, A), hit(60, B), hit(61, A),
-
-    // A/B alternation with scratches every 4
-    hit(63, A), hit(65, B), hit(67, A),
-    sc (69, CW),
-    hit(71, B), hit(73, A), hit(75, B),
-    sc (77, CCW),
-
-    // Build-up to section 2
-    sc (79, CW),  hit(80, A),
-    sc (81, CCW), hit(82, B),
-    sc (83, CW),  hit(84, A),
-    sc (85, CCW), hit(86, B),
-
-    sc (87, CW),
-    sc (88, CCW),
-    sc (89, CW),
-    sc (90, CCW),
-
-    hit(91, A), hit(92, B),
-    sc (93, CW),
-    hit(95, A), hit(96, B),
-    sc (97, CCW),
-    hit(99, A), hit(100, B),
-
-    sc (101, CW), sc (102, CCW),
-    hit(103, A), hit(104, B), hit(105, A),
-
-    sc (107, CW),  hit(108, B),
-    sc (109, CCW), hit(110, A),
-    sc (111, CW),  hit(112, B),
-    sc (113, CCW),
+const LEFT_1: NoteEvent[] = [
+    // Intro taps
+    tap(  "left", 3,  A), tap("left", 5, A), tap("left", 7, B), tap("left", 9, B), tap("left", 11, A),
+    // First hold
+    hold( "left", 13, A, 2),
+    tap(  "left", 17, B), tap("left", 19, A),
+    // Scratch intro
+    sc(   "left", 23, CW), sc("left", 25, CCW),
+    // First spin
+    spin( "left", 29, 4),
+    tap(  "left", 37, A), tap("left", 39, B),
+    dbl(  "left", 41),
+    tap(  "left", 43, A), tap("left", 45, B),
+    sc(   "left", 49, CW), sc("left", 51, CCW), sc("left", 53, CW),
+    hold( "left", 57, B, 2),
+    tap(  "left", 61, A), tap("left", 63, B),
+    dbl(  "left", 65),
+    sc(   "left", 69, CW), sc("left", 71, CCW),
+    spin( "left", 75, 3),
+    tap(  "left", 81, A), tap("left", 83, B), tap("left", 85, A),
+    dbl(  "left", 87),
+    sc(   "left", 91, CW), sc("left", 93, CCW),
+    hold( "left", 97, A, 2),
+    tap(  "left", 101, B), tap("left", 103, A),
+    sc(   "left", 107, CW), sc("left", 109, CCW),
+    tap(  "left", 111, A),
 ];
 
-// ── Section 2: 126.6 BPM (beats 115–212) ─────────────────────────────────────
-const SECTION_2: NoteEvent[] = [
-    hit(117, A), hit(119, A), hit(121, A),
-    sc (123, CW),
-    hit(125, A), hit(127, A),
-    sc (129, CCW),
-
-    // Syncopated hits + scratches
-    hit(131, A), sc(132, CW),  hit(133, B), sc(134, CCW),
-    hit(135, A), sc(136, CW),  hit(137, B), sc(138, CCW),
-
-    // Faster alternation (every beat now)
-    sc (139, CW),  hit(140, A),
-    sc (141, CCW), hit(142, B),
-    sc (143, CW),  hit(144, A),
-    sc (145, CCW), hit(146, B),
-
-    // Scratch bursts
-    sc (147, CW),  sc (147.5, CCW), sc (148, CW),
-    hit(149, A),
-    sc (151, CCW), sc (151.5, CW),  sc (152, CCW),
-    hit(153, B),
-
-    // Longer run
-    hit(155, A), sc(156, CW),
-    hit(157, B), sc(158, CCW),
-    hit(159, A), sc(160, CW),
-    hit(161, B), sc(162, CCW),
-    hit(163, A),
-
-    sc (165, CW), sc (165.5, CCW), sc (166, CW),
-    hit(167, B), hit(168, A),
-    sc (169, CCW),
-
-    hit(171, B), sc(172, CW),
-    hit(173, A), sc(174, CCW),
-    hit(175, B),
-
-    // Dense scratch run (every beat)
-    sc (176, CW),
-    sc (177, CCW),
-    sc (178, CW),
-    sc (179, CCW),
-
-    hit(180, A), hit(181, B),
-    sc (182, CW),
-    hit(183, A), hit(184, B),
-    sc (185, CCW),
-
-    sc (186, CW),  sc (186.5, CCW),
-    sc (187, CW),  sc (187.5, CCW),
-    hit(188, A),   hit(189, B),
-
-    sc (190, CW),  hit(191, A),
-    sc (192, CCW), hit(193, B),
-    sc (194, CW),  hit(195, A),
-
-    // Build
-    sc (196, CW),  sc (196.5, CCW), sc (197, CW),
-    hit(198, B),   hit(199, A),
-
-    sc (200, CCW), hit(201, B),
-    sc (202, CW),  hit(203, A),
-    sc (204, CCW), hit(205, B),
-    sc (206, CW),  hit(207, A),
-
-    sc (208, CW), sc (208.5, CCW),
-    sc (209, CW), sc (209.5, CCW),
-    sc (210, CW),
+const LEFT_2: NoteEvent[] = [
+    tap( "left", 117, A), tap("left", 119, B), tap("left", 121, A),
+    dbl( "left", 123),
+    sc(  "left", 127, CW), sc("left", 129, CCW),
+    spin("left", 133, 4),
+    tap( "left", 141, A), tap("left", 142.5, B), tap("left", 144, A),
+    dbl( "left", 146),
+    sc(  "left", 150, CW), sc("left", 152, CCW), sc("left", 154, CW),
+    hold("left", 158, B, 3),
+    tap( "left", 165, A), tap("left", 167, B),
+    dbl( "left", 169),
+    sc(  "left", 173, CCW),
+    spin("left", 177, 4),
+    tap( "left", 185, A), tap("left", 186.5, B), tap("left", 188, A),
+    dbl( "left", 190),
+    sc(  "left", 194, CW), sc("left", 196, CCW),
+    hold("left", 200, A, 3),
+    tap( "left", 207, B),
 ];
 
-// ── Section 3: 86.3 BPM (beats 212–276) — slower, heavier, theatrical ────────
-const SECTION_3: NoteEvent[] = [
-    hit(213, A),
-    sc (215, CW),
-    hit(216, B),
-    sc (218, CCW),
-    hit(219, A),
-    sc (221, CW),
-    hit(222, B),
-    sc (224, CCW),
+const LEFT_3: NoteEvent[] = [
+    tap( "left", 213, A),
+    sc(  "left", 216, CW),
+    tap( "left", 218, B),
+    sc(  "left", 221, CCW),
+    hold("left", 224, A, 3),
+    tap( "left", 231, B),
+    dbl( "left", 234),
+    sc(  "left", 238, CW), sc("left", 240, CCW),
+    spin("left", 244, 5),
+    tap( "left", 253, A), tap("left", 255, B),
+    dbl( "left", 258),
+    sc(  "left", 262, CW), sc("left", 264, CCW),
+    hold("left", 268, B, 3),
+    tap( "left", 275, A),
+];
 
-    // Held scratches feel — slower tempo, so more spacing
-    hit(226, A), sc(228, CW),
-    hit(229, B), sc(231, CCW),
-    hit(232, A),
+// ── Right lane (P2) ──────────────────────────────────────────────────────────
 
-    sc (234, CW),  sc (235, CCW),
-    hit(236, B),
-    sc (237, CW),  sc (238, CCW),
-    hit(239, A),
+const RIGHT_1: NoteEvent[] = [
+    tap(  "right", 4,  A), tap("right", 6, A), tap("right", 8, B), tap("right", 10, B), tap("right", 12, A),
+    hold( "right", 15, B, 2),
+    tap(  "right", 21, B), tap("right", 25, A),
+    sc(   "right", 27, CCW), sc("right", 29, CW),
+    spin( "right", 33, 4),
+    tap(  "right", 41, B), tap("right", 43, A),
+    dbl(  "right", 45),
+    tap(  "right", 47, B),
+    sc(   "right", 51, CCW), sc("right", 53, CW),
+    hold( "right", 59, A, 2),
+    tap(  "right", 65, B), tap("right", 67, A),
+    dbl(  "right", 69),
+    sc(   "right", 73, CCW), sc("right", 75, CW),
+    spin( "right", 79, 3),
+    tap(  "right", 87, A), tap("right", 89, B), tap("right", 91, A),
+    dbl(  "right", 93),
+    sc(   "right", 97, CCW), sc("right", 99, CW),
+    hold( "right", 103, B, 2),
+    tap(  "right", 109, A), tap("right", 111, B), tap("right", 113, A),
+];
 
-    // Big scratch climax
-    sc (241, CW),
-    sc (242, CCW),
-    sc (243, CW),
-    sc (244, CCW),
-    hit(245, A),   hit(246, B),
+const RIGHT_2: NoteEvent[] = [
+    tap( "right", 118, A), tap("right", 120, B),
+    dbl( "right", 122),
+    sc(  "right", 125, CCW), sc("right", 128, CW),
+    spin("right", 131, 4),
+    tap( "right", 140, A), tap("right", 141.5, B), tap("right", 143, A),
+    hold("right", 146, B, 3),
+    tap( "right", 153, A),
+    dbl( "right", 155),
+    sc(  "right", 159, CCW), sc("right", 161, CW),
+    spin("right", 165, 4),
+    tap( "right", 173, A), tap("right", 174.5, B), tap("right", 176, A),
+    dbl( "right", 178),
+    sc(  "right", 182, CCW), sc("right", 184, CW),
+    hold("right", 188, A, 3),
+    tap( "right", 195, B), tap("right", 197, A),
+    dbl( "right", 199),
+    sc(  "right", 203, CCW), sc("right", 205, CW),
+];
 
-    sc (247, CW),  sc (248, CCW),
-    sc (249, CW),  sc (250, CCW),
-    hit(251, A),   hit(252, B),
-
-    // Triplet pattern
-    sc (253, CW),  sc (253.5, CCW), sc (254, CW),
-    hit(255, A),
-    sc (256, CCW), sc (256.5, CW),  sc (257, CCW),
-    hit(258, B),
-
-    sc (259, CW),  sc (260, CCW),
-    sc (261, CW),  sc (262, CCW),
-
-    hit(263, A),   hit(264, B),
-
-    // Final outro
-    sc (265, CW),
-    hit(267, A),
-    sc (269, CCW),
-    hit(271, B),
-    sc (273, CW),
-    hit(275, A),
+const RIGHT_3: NoteEvent[] = [
+    tap( "right", 214, A),
+    sc(  "right", 217, CCW),
+    tap( "right", 219, B),
+    sc(  "right", 222, CW),
+    spin("right", 226, 4),
+    tap( "right", 236, A),
+    dbl( "right", 239),
+    hold("right", 243, B, 3),
+    tap( "right", 250, A),
+    sc(  "right", 254, CCW), sc("right", 256, CW),
+    dbl( "right", 260),
+    spin("right", 264, 5),
+    tap( "right", 273, A), tap("right", 274.5, B),
 ];
 
 export const CHART: NoteEvent[] = [
-    ...SECTION_1,
-    ...SECTION_2,
-    ...SECTION_3,
+    ...LEFT_1, ...LEFT_2, ...LEFT_3,
+    ...RIGHT_1, ...RIGHT_2, ...RIGHT_3,
 ].sort((a, b) => a.beat - b.beat);
+
+// ── Dev-time two-hand-rule validator ─────────────────────────────────────────
+// Within a single lane, a buttons-group event's timing window must never
+// overlap a spinner-group event's window — one hand can't operate both at
+// once. This is a cheap sanity check over the authored chart, not a runtime
+// gameplay constraint.
+
+function eventSpan(ev: NoteEvent): [number, number] {
+    const isSustain = ev.kind === "hold" || ev.kind === "spin";
+    const start = ev.beat - HIT_WINDOW_BEATS;
+    const end   = ev.beat + (isSustain ? (ev.durationBeats ?? 0) : 0) + HIT_WINDOW_BEATS;
+    return [start, end];
+}
+
+function isButtonsGroup(ev: NoteEvent): boolean {
+    return ev.kind === "tap" || ev.kind === "hold" || ev.kind === "double";
+}
+
+function validateTwoHandRule(events: NoteEvent[]): string[] {
+    const problems: string[] = [];
+    const byLane: Record<Lane, NoteEvent[]> = { left: [], right: [] };
+    for (const ev of events) byLane[ev.lane].push(ev);
+
+    for (const lane of ["left", "right"] as Lane[]) {
+        const laneEvents = [...byLane[lane]].sort((a, b) => a.beat - b.beat);
+        for (let i = 0; i < laneEvents.length; i++) {
+            for (let j = i + 1; j < laneEvents.length; j++) {
+                const a = laneEvents[i];
+                const b = laneEvents[j];
+                if (isButtonsGroup(a) === isButtonsGroup(b)) continue; // same group: no hand conflict
+                const [aStart, aEnd] = eventSpan(a);
+                const [bStart, bEnd] = eventSpan(b);
+                if (aStart < bEnd && bStart < aEnd) {
+                    problems.push(
+                        `two-hand rule violation on ${lane}: ${a.kind}@${a.beat} overlaps ${b.kind}@${b.beat}`
+                    );
+                }
+            }
+        }
+    }
+    return problems;
+}
+
+if (import.meta.env?.DEV) {
+    const problems = validateTwoHandRule(CHART);
+    for (const p of problems) console.warn(`[dj/chart] ${p}`);
+}
