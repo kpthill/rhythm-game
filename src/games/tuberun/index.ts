@@ -1,533 +1,524 @@
-// Tube Run — a Run-3-style rhythm platformer inside a rotating tube.
+// Runner (v2) — a continuous-terrain rhythm platformer inside a tube.
 //
-// The camera looks forward down a cylindrical tube rendered as concentric
-// ellipses shrinking toward a vanishing point.  The runner sits at a fixed
-// angular position on the outermost (front) ring; the tube ROTATES so the
-// runner rides on the floor.
+// The camera looks down a cylindrical tube drawn as concentric rings receding
+// to a vanishing point. A ribbon of terrain (see terrain.ts) is painted across
+// the rings toward the centre; the runner avatar stands on its near end. You
+// STEER (joystick L/R, or spinner) to keep the runner on the drifting ribbon,
+// and JUMP (A) to clear the gaps. Being off the ribbon while grounded — or
+// landing off it — is an instant fall; death rewinds the song to the last
+// checkpoint and resumes.
 //
-// Beat events:
-//   "gap"    → the floor is missing at the current angle; ROTATE to safety.
-//   "jump"   → an obstacle is on the floor; press A to jump over it.
-//   "tunnel" → the tube narrows to a specific safe arc; ROTATE to it.
+// This is milestone M1 (terrain core) plus a basic jump pulled forward from M2.
+// B-action (destroy) and scoring are M2 — omitted here.
 //
-// State machine: SELECT → PLAYING → RESULT
-// Rotation input: spinnerDelta (preferred) or joystick LEFT/RIGHT fallback.
+// State machine: TITLE → PLAYING → RESULT
+// PLAYING sub-phases: "run" → "dying" → "respawn" → "run"
 
 import type p5 from "p5";
 import type { GameModule, GameContext } from "../../platform/game";
 import type { InputSnapshot } from "../../platform/input";
-import { SONG_LENGTH_BEATS } from "../../platform/song";
-import { CHARTS } from "./chart";
-import type { ActiveEvent } from "./notes";
+import { OFFSET } from "../../platform/song";
 import {
-    CX, CY, W, H,
-    FRONT_RING_RADIUS, VP_RADIUS, BEAT_PX,
-    LOOKAHEAD_BEATS, HIT_WINDOW_BEATS,
-    SAFE_ARC_HALF, RUNNER_DOT_R,
-    JUDGMENT_COLOR, eventRadius,
-} from "./notes";
+    W, H, CX, CY,
+    FRONT_RING_RADIUS, VP_RADIUS, LOOKAHEAD_BEATS,
+    RIBBON_HALF_WIDTH, STEER_SPEED, SPINNER_RAD_PER_STEP,
+    JUMP_BEATS, JUMP_LIFT_PX,
+    TERRAIN,
+    radiusAtBeat, ribbonCenter, inGap, lastCheckpoint,
+} from "./terrain";
 
-// ── Module-level state (reset in init / teardown) ─────────────────────────────
+// ── Module-level state (reset in init) ────────────────────────────────────────
 
 let ctx: GameContext;
 let p: p5;
 
-type GameState = "SELECT" | "PLAYING" | "RESULT";
-let gameState: GameState = "SELECT";
+type GameState = "TITLE" | "PLAYING" | "RESULT";
+let gameState: GameState = "TITLE";
 
-// Chart
-let activeEvents: ActiveEvent[] = [];
-let chartIndex  = 0;       // next event to spawn
+type RunPhase = "run" | "dying" | "respawn";
+let runPhase: RunPhase = "run";
+let phaseStartMs = 0;   // p.millis() at the current sub-phase start
+let frozenBeat = 0;     // beat to render while audio is stopped (dying)
 
-// Scores / life
-let score  = 0;
-let combo  = 0;
-let life   = 1.0;
-let failed = false;
+// Runner angular position on the tube (radians, world space). The runner is
+// pinned to screen-bottom; the tube rotates under it. tubeAngle IS the runner's
+// world angle, so "on ribbon" ⇔ |tubeAngle − ribbonCenter| ≤ half-width.
+let tubeAngle = Math.PI / 2;
 
-// Tube rotation (radians; 0 = runner at 3-o'clock, PI/2 = runner at 6-o'clock)
-// Runner is visually pinned at the bottom of the canvas.  We rotate the TUBE
-// world, not the runner.  tubeAngle is the current rotation of the tube.
-// The safe angle on each event is in TUBE space; we compare with tubeAngle.
-let tubeAngle = Math.PI / 2;  // default: runner at 6-o'clock (bottom)
+// Jump state.
+let jumpBeat = -99;     // beat the current jump began (parabolic arc)
+let jumpArmed = true;   // require an A release before the next jump
 
-// Jump state
-let jumpBeat     = -99;    // beat when jump started
-const JUMP_BEATS = 0.8;    // how long the jump lasts (in beats)
-let jumpHeld     = false;
+// Checkpoint audio times, captured as the run crosses each checkpoint beat.
+let cpSeconds: number[] = [];
+let cpCaptured: boolean[] = [];
 
-// Visual beat pulse
-let lastBeat = 0;
+// Result framing.
+let clearedRun = false;
+let furthestBeat = 0;
 
-// Menu
-let selectedChart = 0;
-let menuLatch     = false;
+// Death/respawn timing.
+const DEATH_MS = 480;    // fall animation before the rewind
+const RESPAWN_MS = 750;  // "CHECKPOINT" banner + grace before control returns
 
-// Judgments
-interface Judgment { text: string; frame: number; }
-let judgments: Judgment[] = [];
+// Title pulse / misc.
+let bannerBeat = 0;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Small math helpers ────────────────────────────────────────────────────────
 
-/** Current jump height (0 = on ground, peaks at 1). */
-function jumpPhase(currentBeat: number): number {
-    const elapsed = currentBeat - jumpBeat;
-    if (elapsed < 0 || elapsed > JUMP_BEATS) return 0;
-    // Parabolic arc peaking at midpoint
-    const t = elapsed / JUMP_BEATS;
-    return Math.sin(t * Math.PI);
-}
-
-/** Is the runner currently airborne? */
-function isAirborne(currentBeat: number): boolean {
-    return jumpPhase(currentBeat) > 0.05;
-}
-
-/** Angular difference, normalised to [-PI, PI]. */
+/** Angular difference a−b normalised to [-PI, PI]. */
 function angleDiff(a: number, b: number): number {
     let d = (a - b) % (Math.PI * 2);
-    if (d >  Math.PI) d -= Math.PI * 2;
+    if (d > Math.PI) d -= Math.PI * 2;
     if (d < -Math.PI) d += Math.PI * 2;
     return d;
 }
 
-function pushJudgment(text: string): void {
-    judgments.push({ text, frame: p.frameCount });
+/** Height of the jump arc (0 grounded, peaks ~1 mid-arc). */
+function jumpPhase(currentBeat: number): number {
+    const t = (currentBeat - jumpBeat) / JUMP_BEATS;
+    if (t < 0 || t > 1) return 0;
+    return Math.sin(t * Math.PI);
 }
 
-function registerHit(points: number, quality: string, ev: ActiveEvent): void {
-    combo++;
-    score += points * combo;
-    pushJudgment(quality);
-    ev.resolved = true;
+/** Airborne = high enough in the arc to clear a hole / ignore the floor. */
+function isAirborne(currentBeat: number): boolean {
+    return jumpPhase(currentBeat) > 0.05;
 }
 
-function registerMiss(ev: ActiveEvent): void {
-    combo = 0;
-    life  = Math.max(0, life - 0.1);
-    pushJudgment("MISS");
-    ev.missed = true;
+/** World angle → on-screen angle (runner sits at screen-bottom = +PI/2). */
+function screenAngle(worldAngle: number): number {
+    return worldAngle - tubeAngle + Math.PI / 2;
 }
 
-// ── Init / chart start ────────────────────────────────────────────────────────
+// ── Run lifecycle ─────────────────────────────────────────────────────────────
 
-function startChart(chartIdx: number): void {
-    activeEvents = [];
-    chartIndex   = 0;
-    score        = 0;
-    combo        = 0;
-    life         = 1.0;
-    failed       = false;
-    judgments    = [];
-    tubeAngle    = Math.PI / 2;
-    jumpBeat     = -99;
-    jumpHeld     = false;
-    lastBeat     = 0;
-    selectedChart = chartIdx;
-    gameState    = "PLAYING";
-    void ctx.audio.play(0);
+function startRun(): void {
+    gameState = "PLAYING";
+    runPhase = "run";
+    phaseStartMs = p.millis();
+    tubeAngle = ribbonCenter(TERRAIN, 0);
+    jumpBeat = -99;
+    jumpArmed = true;
+    clearedRun = false;
+    furthestBeat = 0;
+    frozenBeat = 0;
+
+    // Checkpoint 0 is beat 0; its audio time is the song OFFSET. Others are
+    // captured live as the player reaches them.
+    cpSeconds = TERRAIN.checkpoints.map(() => OFFSET);
+    cpCaptured = TERRAIN.checkpoints.map((_, i) => i === 0);
+
+    ctx.audio.stop();
+    void ctx.audio.play(OFFSET);   // start playing from beat 0
 }
 
-// ── Game logic ────────────────────────────────────────────────────────────────
-
-function spawnEvents(currentBeat: number): void {
-    const chart = CHARTS[selectedChart].events;
-    while (chartIndex < chart.length) {
-        const ev = chart[chartIndex];
-        if (currentBeat >= ev.beat - LOOKAHEAD_BEATS) {
-            activeEvents.push({ event: ev, resolved: false, missed: false, jumped: false });
-            chartIndex++;
-        } else break;
-    }
-}
-
-function evaluateEvents(currentBeat: number, input: InputSnapshot): void {
-    for (const ae of activeEvents) {
-        if (ae.resolved || ae.missed) continue;
-        const { event: ev } = ae;
-        const beatDiff = currentBeat - ev.beat;
-
-        // Past the window — MISS
-        if (beatDiff > HIT_WINDOW_BEATS) {
-            registerMiss(ae);
-            continue;
-        }
-        // Not yet in window
-        if (beatDiff < -HIT_WINDOW_BEATS) continue;
-
-        if (ev.type === "jump") {
-            // Player must press A (or be mid-jump) to dodge the obstacle
-            if (input.aPressed && !jumpHeld) {
-                jumpBeat  = currentBeat;
-                jumpHeld  = true;
-                ae.jumped = true;
-                const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * 0.5;
-                registerHit(perfect ? 300 : 100, perfect ? "PERFECT" : "GOOD", ae);
-            } else if (isAirborne(currentBeat)) {
-                // Already airborne from a prior press — auto-clear if timing is close
-                ae.jumped = true;
-                registerHit(100, "GOOD", ae);
-            }
-        } else {
-            // "gap" or "tunnel": player must rotate so tubeAngle ≈ ev.safeAngle
-            const diff = Math.abs(angleDiff(tubeAngle, ev.safeAngle));
-            if (diff <= SAFE_ARC_HALF) {
-                const perfect = diff < SAFE_ARC_HALF * 0.4 && Math.abs(beatDiff) < HIT_WINDOW_BEATS * 0.5;
-                registerHit(perfect ? 300 : 100, perfect ? "PERFECT" : "GOOD", ae);
-            }
-            // else: keep waiting — player still has time to rotate
+/** Capture the live audio time for any checkpoint the run has now reached. */
+function captureCheckpoints(cb: number): void {
+    for (let i = 0; i < TERRAIN.checkpoints.length; i++) {
+        if (!cpCaptured[i] && cb >= TERRAIN.checkpoints[i]) {
+            cpSeconds[i] = ctx.audio.currentSeconds;
+            cpCaptured[i] = true;
         }
     }
-
-    // Prune old events
-    activeEvents = activeEvents.filter(ae => currentBeat - ae.event.beat < LOOKAHEAD_BEATS + 2);
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────────────
+/** Grounded + off the ribbon (or over a hole) = fell. */
+function isFalling(cb: number): boolean {
+    if (cb < 0) return false;             // pre-song lead-in
+    if (isAirborne(cb)) return false;     // jumps are immune
+    if (inGap(TERRAIN, cb)) return true;  // no floor here at all
+    const off = Math.abs(angleDiff(tubeAngle, ribbonCenter(TERRAIN, cb)));
+    return off > RIBBON_HALF_WIDTH;
+}
 
-/** Draw the tube background: concentric ellipses receding to vanishing point. */
-function drawTubeBackground(currentBeat: number): void {
-    p.background(10, 6, 20);
+/** Rewind the song + terrain to the last checkpoint and resume. */
+function rewindToCheckpoint(): void {
+    const cpBeat = lastCheckpoint(TERRAIN, frozenBeat);
+    let idx = 0;
+    for (let i = 0; i < TERRAIN.checkpoints.length; i++) {
+        if (TERRAIN.checkpoints[i] === cpBeat) idx = i;
+    }
+    tubeAngle = ribbonCenter(TERRAIN, cpBeat);   // respawn centred on the path
+    jumpBeat = -99;
+    jumpArmed = true;
+    ctx.audio.stop();
+    void ctx.audio.play(cpSeconds[idx]);
+}
 
-    // Beat pulse on the front ring
-    const beatFrac = currentBeat % 1;
-    const pulse    = beatFrac < 0.12 ? (1 - beatFrac / 0.12) : 0;
+// ── Steering (shared by run + respawn phases) ─────────────────────────────────
 
-    // Draw scroll rings (approach lines at 1-beat intervals)
-    const scroll = (currentBeat % 1) * BEAT_PX;
+let prevSpinnerAngle = 0;
+let spinnerInit = false;
+
+function applySteering(input: InputSnapshot, dt: number): void {
+    if (input.spinnerConnected) {
+        // Prefer per-step delta; fall back to absolute angle wrap if needed.
+        if (input.spinnerDelta !== 0) {
+            tubeAngle += input.spinnerDelta * SPINNER_RAD_PER_STEP;
+        } else if (spinnerInit) {
+            tubeAngle += angleDiff(input.spinnerAngle, prevSpinnerAngle);
+        }
+        prevSpinnerAngle = input.spinnerAngle;
+        spinnerInit = true;
+    }
+    // Joystick is always live (primary control). Direction chases the ribbon:
+    // press toward the side of the screen the ribbon sits on to slide onto it.
+    const d = input.direction;
+    const left = d === "LEFT" || d === "UP_LEFT" || d === "DOWN_LEFT";
+    const right = d === "RIGHT" || d === "UP_RIGHT" || d === "DOWN_RIGHT";
+    const step = STEER_SPEED * (dt / 1000);
+    if (left) tubeAngle += step;   // ribbon left of centre ⇔ (center−tubeAngle)>0
+    if (right) tubeAngle -= step;
+}
+
+// ── Rendering: tube, ribbon, obstacles, runner ────────────────────────────────
+
+function drawTube(cb: number): void {
+    p.background(9, 7, 16);
+
+    // Approach rings at 1-beat intervals, scrolling toward the front.
+    const scroll = ((cb % 1) + 1) % 1;
     p.noFill();
-    for (let k = 0; k <= LOOKAHEAD_BEATS + 1; k++) {
-        const r = FRONT_RING_RADIUS - (k * BEAT_PX - scroll);
-        if (r < VP_RADIUS || r > FRONT_RING_RADIUS + 2) continue;
-        const alpha = p.map(r, VP_RADIUS, FRONT_RING_RADIUS, 18, 55);
-        p.stroke(55, 45, 100, alpha);
-        p.strokeWeight(1);
+    p.strokeWeight(1);
+    for (let kk = 0; kk <= LOOKAHEAD_BEATS + 1; kk++) {
+        const r = radiusAtBeat(cb + kk - scroll, cb);
+        if (r < VP_RADIUS || r > FRONT_RING_RADIUS + 1) continue;
+        const a = p.map(r, VP_RADIUS, FRONT_RING_RADIUS, 12, 42);
+        p.stroke(48, 40, 92, a);
         p.ellipse(CX, CY, r * 2, r * 2);
     }
 
-    // Tube wall radial lines (8 lanes)
+    // Radial guide lines fixed to the tube wall (rotate with tubeAngle).
     p.strokeWeight(0.5);
+    p.stroke(38, 30, 74, 70);
     for (let i = 0; i < 8; i++) {
-        const angle = tubeAngle + (i * Math.PI * 2) / 8;
-        const xa = CX + Math.cos(angle) * VP_RADIUS;
-        const ya = CY + Math.sin(angle) * VP_RADIUS;
-        const xb = CX + Math.cos(angle) * FRONT_RING_RADIUS;
-        const yb = CY + Math.sin(angle) * FRONT_RING_RADIUS;
-        p.stroke(40, 30, 80, 100);
-        p.line(xa, ya, xb, yb);
+        const ang = screenAngle((i * Math.PI * 2) / 8);
+        p.line(
+            CX + Math.cos(ang) * VP_RADIUS, CY + Math.sin(ang) * VP_RADIUS,
+            CX + Math.cos(ang) * FRONT_RING_RADIUS, CY + Math.sin(ang) * FRONT_RING_RADIUS,
+        );
     }
 
-    // Front ring (outermost, the "floor")
-    const ringR = 220 + pulse * 35;
-    const ringG = 170 + pulse * 40;
-    const ringB = 255;
-    p.stroke(ringR, ringG, ringB);
-    p.strokeWeight(2);
+    // Front ring (the floor plane) with a soft beat pulse.
+    const beatFrac = ((cb % 1) + 1) % 1;
+    const pulse = beatFrac < 0.12 ? 1 - beatFrac / 0.12 : 0;
     p.noFill();
+    p.stroke(90 + pulse * 60, 80 + pulse * 60, 150 + pulse * 40);
+    p.strokeWeight(2);
     p.ellipse(CX, CY, FRONT_RING_RADIUS * 2, FRONT_RING_RADIUS * 2);
 
-    // Vanishing point dot
-    p.fill(ringR, ringG, ringB, 120);
+    // Vanishing point.
     p.noStroke();
+    p.fill(120, 110, 190, 120);
     p.ellipse(CX, CY, VP_RADIUS * 2, VP_RADIUS * 2);
 }
 
-/** Draw approaching event rings. */
-function drawApproachRings(currentBeat: number): void {
-    for (const ae of activeEvents) {
-        if (ae.resolved || ae.missed) continue;
-        const { event: ev } = ae;
-        const r = eventRadius(ev.beat, currentBeat);
-        if (r < VP_RADIUS || r > FRONT_RING_RADIUS + 20) continue;
-
-        const [cr, cg, cb] = ev.color;
-        const beatsLeft = ev.beat - currentBeat;
-        const alpha = p.map(beatsLeft, 0, LOOKAHEAD_BEATS, 200, 50);
-
-        if (ev.type === "jump") {
-            // Draw a solid ring with obstacle bumps
-            p.noFill();
-            p.stroke(cr, cg, cb, alpha);
-            p.strokeWeight(3);
-            p.ellipse(CX, CY, r * 2, r * 2);
-            // Obstacle marker: a rectangle protruding outward from floor position
-            const floorAngle = Math.PI / 2;  // runner lives at bottom of canvas (6-o'clock)
-            const sx = CX + Math.cos(floorAngle) * r;
-            const sy = CY + Math.sin(floorAngle) * r;
-            p.fill(cr, cg, cb, alpha);
-            p.noStroke();
-            p.rectMode(p.CENTER);
-            p.rect(sx, sy, 10, 6, 2);
-            p.rectMode(p.CORNER);
-        } else if (ev.type === "gap") {
-            // Draw a dashed ring with a gap at the danger zone and safe zone highlighted
-            p.noFill();
-            p.strokeWeight(3);
-
-            // Draw safe arc in green
-            const safeScreen = ev.safeAngle - tubeAngle + Math.PI / 2;
-            p.stroke(80, 220, 80, alpha);
-            drawArc(CX, CY, r, safeScreen - SAFE_ARC_HALF, safeScreen + SAFE_ARC_HALF);
-
-            // Draw danger arcs in red (rest of the ring)
-            p.stroke(cr, cg, cb, alpha * 0.7);
-            p.strokeWeight(2);
-            drawArc(CX, CY, r, safeScreen + SAFE_ARC_HALF, safeScreen - SAFE_ARC_HALF + Math.PI * 2);
-
-        } else {
-            // "tunnel": draw a narrow gap that player must fit through
-            p.noFill();
-            p.strokeWeight(2);
-            const safeScreen = ev.safeAngle - tubeAngle + Math.PI / 2;
-            // Walls (danger)
-            p.stroke(cr, cg, cb, alpha);
-            drawArc(CX, CY, r, safeScreen + SAFE_ARC_HALF, safeScreen - SAFE_ARC_HALF + Math.PI * 2);
-            // Safe gap
-            p.stroke(80, 255, 80, alpha);
-            p.strokeWeight(3);
-            drawArc(CX, CY, r, safeScreen - SAFE_ARC_HALF, safeScreen + SAFE_ARC_HALF);
-        }
-    }
+function ribbonEdge(beat: number, side: number, cb: number): { x: number; y: number } {
+    const r = radiusAtBeat(beat, cb);
+    const s = screenAngle(ribbonCenter(TERRAIN, beat) + side * RIBBON_HALF_WIDTH);
+    return { x: CX + Math.cos(s) * r, y: CY + Math.sin(s) * r };
 }
 
-/** Draw an arc of a circle (centre cx,cy, radius r, from angle a0 to a1 in radians). */
-function drawArc(cx: number, cy: number, r: number, a0: number, a1: number): void {
-    // Normalise so a1 > a0
-    let end = a1;
-    while (end < a0) end += Math.PI * 2;
-    const steps = Math.max(2, Math.round(((end - a0) / (Math.PI * 2)) * 48));
-    p.beginShape();
-    for (let i = 0; i <= steps; i++) {
-        const angle = a0 + (i / steps) * (end - a0);
-        p.vertex(cx + Math.cos(angle) * r, cy + Math.sin(angle) * r);
-    }
-    p.endShape();
-}
+/** Paint the ribbon across the rings; gaps read as holes (background shows). */
+function drawRibbon(cb: number): void {
+    const step = 0.2;
+    const far = cb + LOOKAHEAD_BEATS;
 
-/** Draw the runner avatar at the bottom of the front ring. */
-function drawRunner(currentBeat: number): void {
-    // Runner is always at screen-bottom of the front ring (6-o'clock = angle PI/2)
-    const runnerAngle = Math.PI / 2;
-    const jph = jumpPhase(currentBeat);
-    // Jump lifts the runner inward (toward center) by up to 22 px
-    const jumpLift = jph * 22;
-    const r = FRONT_RING_RADIUS - jumpLift;
-    const rx = CX + Math.cos(runnerAngle) * r;
-    const ry = CY + Math.sin(runnerAngle) * r;
-
-    // Shadow on ring
+    // Filled band (draw far→near so nearer segments overlap cleanly).
     p.noStroke();
-    p.fill(0, 0, 0, 60);
-    p.ellipse(CX + Math.cos(runnerAngle) * FRONT_RING_RADIUS,
-              CY + Math.sin(runnerAngle) * FRONT_RING_RADIUS,
-              10, 4);
+    for (let b = far - step; b >= cb; b -= step) {
+        const b1 = b + step;
+        const mid = b + step / 2;
+        if (inGap(TERRAIN, mid)) continue;
+        const oL = ribbonEdge(b1, -1, cb);
+        const oR = ribbonEdge(b1, +1, cb);
+        const iR = ribbonEdge(b, +1, cb);
+        const iL = ribbonEdge(b, -1, cb);
+        const depth = (b - cb) / LOOKAHEAD_BEATS;   // 0 near … 1 far
+        const shade = 1 - depth * 0.55;
+        p.fill(40 * shade, 150 * shade, 165 * shade);
+        p.quad(oL.x, oL.y, oR.x, oR.y, iR.x, iR.y, iL.x, iL.y);
+    }
 
-    // Runner body
-    const bodyColor: [number, number, number] = jph > 0.05
-        ? [120, 220, 255]  // airborne: blue-white
-        : [200, 180, 255]; // grounded: lavender
-    p.fill(...bodyColor);
-    p.stroke(255, 255, 255, 180);
+    // Bright edge rails, broken at gaps, so curves + holes read clearly.
     p.strokeWeight(1.5);
-    p.ellipse(rx, ry, RUNNER_DOT_R * 2, RUNNER_DOT_R * 2);
+    p.stroke(120, 240, 235);
+    for (let b = cb; b < far; b += step) {
+        const b1 = Math.min(b + step, far);
+        if (inGap(TERRAIN, b + step / 2)) continue;
+        for (const side of [-1, 1]) {
+            const a0 = ribbonEdge(b, side, cb);
+            const a1 = ribbonEdge(b1, side, cb);
+            p.line(a0.x, a0.y, a1.x, a1.y);
+        }
+    }
 
-    // Trail when jumping
-    if (jph > 0.1) {
-        for (let i = 1; i <= 3; i++) {
-            const tr = FRONT_RING_RADIUS - (jph - i * 0.08) * 22;
-            if (tr > FRONT_RING_RADIUS - 0.5) continue;
-            const tx = CX + Math.cos(runnerAngle) * tr;
-            const ty = CY + Math.sin(runnerAngle) * tr;
-            p.noStroke();
-            p.fill(120, 220, 255, 60 - i * 15);
-            p.ellipse(tx, ty, (RUNNER_DOT_R - i) * 2, (RUNNER_DOT_R - i) * 2);
+    // Gap lips: a warm tick at each hole edge so "JUMP HERE" reads.
+    p.stroke(255, 150, 70);
+    p.strokeWeight(2);
+    for (const g of TERRAIN.gaps) {
+        for (const lip of [g.at - g.half, g.at + g.half]) {
+            if (lip < cb || lip > far) continue;
+            const l = ribbonEdge(lip, -1, cb);
+            const r = ribbonEdge(lip, +1, cb);
+            p.line(l.x, l.y, r.x, r.y);
         }
     }
 }
 
-/** HUD: life bar, score, combo, judgments. */
-function drawHUD(): void {
-    // Life bar at bottom of canvas
-    const barW = 220;
-    const barX = CX - barW / 2;
-    const barY = H - 14;
-    p.noStroke();
-    p.fill(30, 24, 50);
-    p.rect(barX, barY, barW, 5, 2);
-    const lc = life > 0.5
-        ? p.color(80, 200, 120)
-        : life > 0.25
-            ? p.color(230, 180, 40)
-            : p.color(220, 60, 60);
-    p.fill(lc);
-    p.rect(barX, barY, barW * life, 5, 2);
-
-    // Score
-    p.fill(200, 195, 220);
-    p.noStroke();
-    p.textAlign(p.RIGHT, p.TOP);
-    p.textSize(9);
-    p.text(score.toString().padStart(7, "0"), W - 2, 4);
-
-    // Combo
-    if (combo > 1) {
-        p.textAlign(p.LEFT, p.TOP);
-        p.textSize(9);
-        p.fill(180, 160, 220);
-        p.text(`${combo}×`, 4, 4);
+/** Obstacles: small pillars standing on the ribbon (visual only in M1). */
+function drawObstacles(cb: number): void {
+    for (const ob of TERRAIN.obstacles) {
+        if (ob.beat < cb - 0.3 || ob.beat > cb + LOOKAHEAD_BEATS) continue;
+        const r = radiusAtBeat(ob.beat, cb);
+        const s = screenAngle(ribbonCenter(TERRAIN, ob.beat) + ob.offset);
+        const bx = CX + Math.cos(s) * r;
+        const by = CY + Math.sin(s) * r;
+        // Raise "outward" (toward the front / larger radius) so it stands up.
+        const depth = (ob.beat - cb) / LOOKAHEAD_BEATS;
+        const size = p.map(depth, 0, 1, 11, 3);
+        const ox = Math.cos(s) * size * 0.7;
+        const oy = Math.sin(s) * size * 0.7;
+        p.noStroke();
+        p.fill(230, 90, 90);
+        p.push();
+        p.translate(bx + ox, by + oy);
+        p.rectMode(p.CENTER);
+        p.rect(0, 0, size, size, 1);
+        p.fill(255, 200, 120);
+        p.rect(0, -size * 0.15, size * 0.5, size * 0.5, 1);
+        p.pop();
     }
-
-    // Judgments
-    judgments = judgments.filter(j => p.frameCount - j.frame < 55);
-    for (const j of judgments) {
-        const age   = p.frameCount - j.frame;
-        const alpha = p.map(age, 30, 55, 255, 0);
-        const dy    = p.map(age, 0, 55, 0, -18);
-        const [jr, jg, jb] = JUDGMENT_COLOR[j.text] ?? [200, 200, 200];
-        p.textAlign(p.CENTER, p.CENTER);
-        p.textSize(12);
-        p.fill(jr, jg, jb, alpha);
-        p.text(j.text, CX, CY + 50 + dy);
-    }
+    p.rectMode(p.CORNER);
 }
 
-/** Minimal input indicator: bottom-left. */
-function drawInputIndicator(input: InputSnapshot): void {
-    const ox = 10, oy = H - 28;
-    const pip = 4;
-
-    // D-pad
-    const arms: [string, number, number][] = [
-        ["UP", 0, -pip * 1.5], ["DOWN", 0, pip * 1.5],
-        ["LEFT", -pip * 1.5, 0], ["RIGHT", pip * 1.5, 0],
-    ];
-    for (const [dir, dx, dy] of arms) {
-        const active =
-            input.direction === dir ||
-            (dir === "UP"    && (input.direction === "UP_LEFT"   || input.direction === "UP_RIGHT")) ||
-            (dir === "DOWN"  && (input.direction === "DOWN_LEFT" || input.direction === "DOWN_RIGHT")) ||
-            (dir === "LEFT"  && (input.direction === "UP_LEFT"   || input.direction === "DOWN_LEFT")) ||
-            (dir === "RIGHT" && (input.direction === "UP_RIGHT"  || input.direction === "DOWN_RIGHT"));
-        p.noStroke();
-        p.fill(active ? 200 : 40);
-        p.rect(ox + dx - 2, oy + dy - 2, 5, 5, 1);
+/**
+ * Draw the runner avatar — a small readable figure standing at screen-bottom.
+ * mode: normal running, airborne (tucked), or falling (dying tumble).
+ */
+function drawRunner(cb: number, mode: "run" | "air" | "fall", fallT: number): void {
+    const jph = jumpPhase(cb);
+    let feetR = FRONT_RING_RADIUS - jph * JUMP_LIFT_PX;
+    let tumble = 0;
+    let alpha = 255;
+    if (mode === "fall") {
+        feetR = FRONT_RING_RADIUS + fallT * 70;   // drop off the front
+        tumble = fallT * Math.PI * 1.5;
+        alpha = 255 * (1 - fallT);
     }
-    // A button
-    p.fill(input.aHeld ? 80 : 30, input.aHeld ? 180 : 30, input.aHeld ? 255 : 60);
-    p.noStroke();
-    p.ellipse(ox + 22, oy, 7, 7);
-    // Spinner indicator
-    if (input.spinnerConnected) {
-        p.fill(100, 200, 80);
+    const fx = CX;                 // screen-bottom: cos(PI/2)=0
+    const fy = CY + feetR;
+
+    // Ground shadow (skip while high in the air).
+    if (mode !== "fall" && jph < 0.6) {
         p.noStroke();
-        p.ellipse(ox + 33, oy, 5, 5);
+        p.fill(0, 0, 0, 70 * (1 - jph));
+        p.ellipse(CX, CY + FRONT_RING_RADIUS, 11, 4);
     }
-}
 
-// ── Screens ───────────────────────────────────────────────────────────────────
+    const airborne = mode === "air" || jph > 0.05;
+    const body: [number, number, number] =
+        mode === "fall" ? [255, 90, 90]
+        : airborne ? [130, 225, 255]
+        : [210, 195, 255];
 
-function drawSelect(input: InputSnapshot): void {
-    p.background(10, 6, 20);
-
-    // Decorative concentric rings
+    p.push();
+    p.translate(fx, fy);
+    p.rotate(tumble);           // "up" is -y (toward the tube centre)
+    p.stroke(body[0], body[1], body[2], alpha);
+    p.strokeWeight(2);
     p.noFill();
-    for (let r = 20; r <= FRONT_RING_RADIUS; r += 18) {
-        const alpha = p.map(r, 0, FRONT_RING_RADIUS, 15, 55);
-        p.stroke(60, 50, 110, alpha);
-        p.strokeWeight(r === FRONT_RING_RADIUS ? 2 : 0.5);
+
+    // Torso.
+    p.line(0, -6, 0, -13);
+    // Head.
+    p.fill(body[0], body[1], body[2], alpha);
+    p.noStroke();
+    p.ellipse(0, -16, 6, 6);
+    p.stroke(body[0], body[1], body[2], alpha);
+    p.strokeWeight(2);
+    p.noFill();
+
+    if (airborne) {
+        // Tucked pose.
+        p.line(0, -6, -3, -1);
+        p.line(0, -6, 3, -1);
+        p.line(0, -11, -5, -13);
+        p.line(0, -11, 5, -13);
+    } else {
+        // Running pose: legs + arms swing with the beat.
+        const swing = Math.sin(cb * Math.PI * 2) * 4;
+        p.line(0, -6, -swing, 0);
+        p.line(0, -6, swing, 0);
+        p.line(0, -11, swing * 0.8, -8);
+        p.line(0, -11, -swing * 0.8, -8);
+    }
+    p.pop();
+}
+
+/** Steering aid: a chevron at the bottom pointing to the ribbon when off-path. */
+function drawSteerHint(cb: number): void {
+    if (cb < 0 || inGap(TERRAIN, cb)) return;
+    const off = angleDiff(ribbonCenter(TERRAIN, cb), tubeAngle);
+    if (Math.abs(off) <= RIBBON_HALF_WIDTH) return;
+    const dir = off > 0 ? -1 : 1;   // off>0 ⇒ ribbon on screen-left ⇒ point/steer left
+    const x = CX + dir * 30;
+    const y = CY + FRONT_RING_RADIUS + 10;
+    p.noStroke();
+    p.fill(255, 90, 90, 220);
+    p.triangle(x + dir * 6, y, x - dir * 3, y - 5, x - dir * 3, y + 5);
+}
+
+// ── HUD ────────────────────────────────────────────────────────────────────────
+
+function drawHUD(cb: number): void {
+    // Progress bar (distance framing for the runner fantasy).
+    const barW = 240;
+    const bx = CX - barW / 2;
+    const by = H - 10;
+    const prog = Math.max(0, Math.min(1, cb / TERRAIN.endBeat));
+    p.noStroke();
+    p.fill(28, 24, 46);
+    p.rect(bx, by, barW, 4, 2);
+    p.fill(120, 220, 210);
+    p.rect(bx, by, barW * prog, 4, 2);
+    // Checkpoint pips.
+    for (const c of TERRAIN.checkpoints) {
+        const px = bx + barW * Math.min(1, c / TERRAIN.endBeat);
+        p.fill(cb >= c ? p.color(255, 220, 120) : p.color(70, 64, 96));
+        p.ellipse(px, by + 2, 4, 4);
+    }
+
+    p.textAlign(p.LEFT, p.TOP);
+    p.textSize(8);
+    p.fill(150, 140, 185);
+    p.text("RUNNER", 4, 4);
+    p.textAlign(p.RIGHT, p.TOP);
+    p.text(`${Math.max(0, Math.floor(cb))} / ${TERRAIN.endBeat}`, W - 4, 4);
+}
+
+function drawBanner(text: string, col: [number, number, number], up: boolean): void {
+    const t = (p.millis() - phaseStartMs) / 1000;
+    const dy = up ? -Math.min(14, t * 40) : 0;
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(16);
+    p.fill(col[0], col[1], col[2]);
+    p.noStroke();
+    p.text(text, CX, CY - 46 + dy);
+}
+
+// ── Screens ─────────────────────────────────────────────────────────────────────
+
+function drawTitle(input: InputSnapshot): void {
+    p.background(9, 7, 16);
+    bannerBeat += 0.03;
+    p.noFill();
+    for (let r = 18; r <= FRONT_RING_RADIUS; r += 16) {
+        const a = p.map(r, 0, FRONT_RING_RADIUS, 12, 50);
+        p.stroke(60, 50, 110, a);
+        p.strokeWeight(r >= FRONT_RING_RADIUS - 1 ? 2 : 0.5);
         p.ellipse(CX, CY, r * 2, r * 2);
     }
+    // Demo runner on the front ring.
+    tubeAngle = Math.PI / 2;
+    jumpBeat = -99;
+    drawRunner(bannerBeat, "run", 0);
 
     p.noStroke();
     p.textAlign(p.CENTER, p.CENTER);
-    p.fill(140, 130, 180);
+    p.fill(220, 210, 255);
+    p.textSize(26);
+    p.text("RUNNER", CX, 44);
+    p.fill(140, 160, 200);
     p.textSize(9);
-    p.text("TUBE RUN", CX, 28);
-    p.fill(210, 200, 255);
-    p.textSize(14);
-    p.text("SELECT CHART", CX, 50);
+    p.text("stay on the ribbon · jump the gaps", CX, 66);
 
-    // Draw runner at bottom of demo rings
-    p.fill(200, 180, 255);
-    p.stroke(255, 255, 255, 160);
-    p.strokeWeight(1.5);
-    p.ellipse(CX, CY + FRONT_RING_RADIUS, RUNNER_DOT_R * 2, RUNNER_DOT_R * 2);
-
-    for (let i = 0; i < CHARTS.length; i++) {
-        const y = 100 + i * 32;
-        const sel = i === selectedChart;
-        p.fill(sel ? 230 : 110, sel ? 215 : 105, sel ? 255 : 145);
-        p.textSize(sel ? 15 : 11);
-        p.text((sel ? "> " : "  ") + CHARTS[i].name, CX, y);
-    }
-
-    p.fill(90, 80, 120);
+    p.fill(120, 200, 190);
+    p.textSize(11);
+    p.text("PRESS A TO RUN", CX, H - 58);
+    p.fill(95, 88, 125);
     p.textSize(8);
-    p.text("UP/DN to choose   A to start", CX, 195);
-    p.text("Rotate tube with spinner or joystick L/R", CX, 207);
-    p.text("Press A to JUMP", CX, 219);
+    p.text("Joystick L/R (or spinner) to steer", CX, H - 40);
+    p.text("A to jump   ·   hold START to quit", CX, H - 28);
 
-    // Menu navigation
-    const dirUp   = input.direction === "UP";
-    const dirDown = input.direction === "DOWN";
-    if (!dirUp && !dirDown) menuLatch = false;
-    else if (!menuLatch) {
-        menuLatch = true;
-        if (dirUp)   selectedChart = (selectedChart - 1 + CHARTS.length) % CHARTS.length;
-        if (dirDown) selectedChart = (selectedChart + 1) % CHARTS.length;
-    }
-
-    if (input.aPressed) startChart(selectedChart);
+    if (input.aPressed) startRun();
 }
 
 function drawPlaying(input: InputSnapshot, dt: number): void {
-    const cb = ctx.beatNow();
+    const now = p.millis();
 
-    // ── Input: tube rotation ──────────────────────────────────────────────────
-    if (input.spinnerConnected) {
-        // Spinner: each step ~2° rotation (adjust sensitivity)
-        tubeAngle += input.spinnerDelta * (Math.PI / 90);
-    } else {
-        // Joystick fallback: LEFT/RIGHT rotate the tube
-        const rotateSpeed = (Math.PI / 180) * 180 * (dt / 1000); // 180°/sec
-        if (input.direction === "LEFT"  || input.direction === "UP_LEFT"   || input.direction === "DOWN_LEFT") {
-            tubeAngle -= rotateSpeed;
+    if (runPhase === "run") {
+        const cb = ctx.beatNow();
+        furthestBeat = Math.max(furthestBeat, cb);
+        captureCheckpoints(cb);
+        applySteering(input, dt);
+
+        // Jump input (edge-triggered; require an A release between jumps).
+        if (input.aPressed && jumpArmed && !isAirborne(cb)) {
+            jumpBeat = cb;
+            jumpArmed = false;
         }
-        if (input.direction === "RIGHT" || input.direction === "UP_RIGHT"  || input.direction === "DOWN_RIGHT") {
-            tubeAngle += rotateSpeed;
+        if (!input.aHeld) jumpArmed = true;
+
+        // Death check.
+        if (isFalling(cb)) {
+            frozenBeat = cb;
+            ctx.audio.stop();
+            runPhase = "dying";
+            phaseStartMs = now;
         }
+
+        drawTube(cb);
+        drawRibbon(cb);
+        drawObstacles(cb);
+        drawSteerHint(cb);
+        drawRunner(cb, isAirborne(cb) ? "air" : "run", 0);
+        drawHUD(cb);
+
+        if (cb >= TERRAIN.endBeat) {
+            clearedRun = true;
+            ctx.audio.stop();
+            gameState = "RESULT";
+        }
+        return;
     }
 
-    // ── Input: jump ──────────────────────────────────────────────────────────
-    if (input.aPressed && !isAirborne(cb)) {
-        jumpBeat = cb;
-        jumpHeld = true;
+    if (runPhase === "dying") {
+        const t = Math.min(1, (now - phaseStartMs) / DEATH_MS);
+        drawTube(frozenBeat);
+        drawRibbon(frozenBeat);
+        drawObstacles(frozenBeat);
+        drawRunner(frozenBeat, "fall", t);
+        drawHUD(frozenBeat);
+        drawBanner("FELL", [255, 100, 100], false);
+        if (t >= 1) {
+            rewindToCheckpoint();
+            runPhase = "respawn";
+            phaseStartMs = now;
+        }
+        return;
     }
-    if (!input.aHeld) jumpHeld = false;
 
-    // ── Beat pulse tracking ───────────────────────────────────────────────────
-    const beat = Math.floor(cb);
-    if (beat !== Math.floor(lastBeat)) lastBeat = cb;
-
-    // ── Update & render ───────────────────────────────────────────────────────
-    spawnEvents(cb);
-    evaluateEvents(cb, input);
-    drawTubeBackground(cb);
-    drawApproachRings(cb);
-    drawRunner(cb);
-    drawInputIndicator(input);
-    drawHUD();
-
-    // Check failure/song end
-    if (life <= 0) failed = true;
-    if (cb >= SONG_LENGTH_BEATS || (failed && cb - jumpBeat > 2)) {
-        ctx.audio.stop();
-        gameState = "RESULT";
+    // runPhase === "respawn": banner + grace, steering allowed, no death.
+    const cbRaw = ctx.beatNow();
+    const cpBeat = lastCheckpoint(TERRAIN, frozenBeat);
+    const cb = ctx.audio.playing ? cbRaw : cpBeat;   // guard audio warm-up
+    applySteering(input, dt);
+    drawTube(cb);
+    drawRibbon(cb);
+    drawObstacles(cb);
+    drawSteerHint(cb);
+    drawRunner(cb, "run", 0);
+    drawHUD(cb);
+    drawBanner("CHECKPOINT", [255, 220, 120], true);
+    if (now - phaseStartMs >= RESPAWN_MS) {
+        runPhase = "run";
     }
 }
 
 function drawResult(input: InputSnapshot): void {
-    p.background(10, 6, 20);
+    p.background(9, 7, 16);
     p.noFill();
     p.stroke(140, 110, 220);
     p.strokeWeight(2);
@@ -536,55 +527,52 @@ function drawResult(input: InputSnapshot): void {
     p.noStroke();
     p.textAlign(p.CENTER, p.CENTER);
     p.fill(220, 210, 255);
-    p.textSize(20);
-    p.text(failed ? "FAIL" : "CLEAR!", CX, CY - 30);
-    p.textSize(12);
-    p.text(`SCORE: ${score}`, CX, CY + 4);
+    p.textSize(22);
+    p.text(clearedRun ? "CLEAR!" : "RUN ENDED", CX, CY - 24);
+    p.textSize(11);
+    p.fill(150, 200, 190);
+    const pct = Math.round(Math.min(1, furthestBeat / TERRAIN.endBeat) * 100);
+    p.text(`DISTANCE  ${pct}%`, CX, CY + 6);
     p.textSize(9);
     p.fill(140, 130, 170);
-    p.text("A to replay   ·   hold START to exit", CX, CY + 26);
+    p.text("A to run again   ·   hold START to exit", CX, CY + 30);
 
-    if (input.aPressed) gameState = "SELECT";
+    if (input.aPressed) gameState = "TITLE";
 }
 
-// ── Module export ─────────────────────────────────────────────────────────────
+// ── Module export ───────────────────────────────────────────────────────────────
 
-const tuberun: GameModule = {
+const runner: GameModule = {
     id: "tuberun",
-    title: "Tube Run",
+    title: "Runner",
     author: "kpthill",
 
     init(c) {
-        ctx          = c;
-        p            = c.p;
-        gameState    = "SELECT";
-        selectedChart = 0;
-        menuLatch    = false;
-        tubeAngle    = Math.PI / 2;
-        jumpBeat     = -99;
-        jumpHeld     = false;
-        lastBeat     = 0;
-        activeEvents = [];
-        judgments    = [];
-        score        = 0;
-        combo        = 0;
-        life         = 1.0;
-        failed       = false;
+        ctx = c;
+        p = c.p;
+        gameState = "TITLE";
+        runPhase = "run";
+        tubeAngle = Math.PI / 2;
+        jumpBeat = -99;
+        jumpArmed = true;
+        clearedRun = false;
+        furthestBeat = 0;
+        bannerBeat = 0;
+        spinnerInit = false;
+        prevSpinnerAngle = 0;
     },
 
     frame(input: InputSnapshot, dt: number) {
         switch (gameState) {
-            case "SELECT":  drawSelect(input);       break;
-            case "PLAYING": drawPlaying(input, dt);  break;
-            case "RESULT":  drawResult(input);       break;
+            case "TITLE":   drawTitle(input);         break;
+            case "PLAYING": drawPlaying(input, dt);   break;
+            case "RESULT":  drawResult(input);        break;
         }
     },
 
     teardown() {
-        activeEvents = [];
-        judgments    = [];
         ctx.audio.stop();
     },
 };
 
-export default tuberun;
+export default runner;
