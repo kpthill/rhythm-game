@@ -474,7 +474,7 @@ function drawNotes(ls: LaneState, currentBeat: number): void {
     }
 }
 
-function drawPlatter(ls: LaneState, laneInput: LaneInput): void {
+function drawPlatter(ls: LaneState): void {
     const cx = laneCenterX(ls.lane);
     const cy = PLATTER_CY;
     const r  = PLATTER_R;
@@ -507,10 +507,6 @@ function drawPlatter(ls: LaneState, laneInput: LaneInput): void {
     p.fill(200, 190, 220);
     p.ellipse(cx, cy, 3, 3);
 
-    p.textAlign(p.CENTER, p.TOP);
-    p.textSize(5.5);
-    p.fill(laneInput.spinnerConnected ? 90 : 60, laneInput.spinnerConnected ? 210 : 60, 110);
-    p.text(laneInput.spinnerConnected ? "SPIN" : "KEYS", cx, cy + r + 2);
 }
 
 function drawJudgments(ls: LaneState): void {
@@ -594,8 +590,8 @@ function framePlaying(input: InputSnapshot): void {
     drawLanePanel(rightState, cb);
     drawNotes(leftState, cb);
     drawNotes(rightState, cb);
-    drawPlatter(leftState, p1Lane);
-    drawPlatter(rightState, p2Lane);
+    drawPlatter(leftState);
+    drawPlatter(rightState);
     drawHUD(cb);
 
     if (life <= 0 && !failed) {

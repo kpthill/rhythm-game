@@ -58,18 +58,16 @@ export function sampleGesture(
     currentBeat: number,
     stallGraceBeats: number,
 ): GestureResult {
-    let visualDelta = 0;
+    let visualDelta = input.spinnerDelta;
+    if (input.spinnerDelta !== 0) g.samples.push({ t: nowMs, d: input.spinnerDelta });
 
-    if (input.spinnerConnected) {
-        if (input.spinnerDelta !== 0) g.samples.push({ t: nowMs, d: input.spinnerDelta });
-        visualDelta = input.spinnerDelta;
-    } else {
-        // Joystick fallback: holding a direction feeds the accumulator every frame, so a
-        // quick tap crosses SCRATCH_THRESHOLD almost immediately (a "scratch") while only a
-        // sustained hold keeps `lastActivityBeat` fresh long enough to satisfy a spin note.
-        if (input.direction === "LEFT")  { g.samples.push({ t: nowMs, d: -FALLBACK_MAGNITUDE }); visualDelta = -FALLBACK_MAGNITUDE; }
-        if (input.direction === "RIGHT") { g.samples.push({ t: nowMs, d:  FALLBACK_MAGNITUDE }); visualDelta =  FALLBACK_MAGNITUDE; }
-    }
+    // Joystick fallback — ALWAYS active per the spec, not just when the spinner is
+    // disconnected (the emulator's virtual spinner reports connected, and the cabinet's
+    // always is). Holding a direction feeds the accumulator every frame, so a quick tap
+    // crosses SCRATCH_THRESHOLD almost immediately (a "scratch") while only a sustained
+    // hold keeps `lastActivityBeat` fresh long enough to satisfy a spin note.
+    if (input.direction === "LEFT")  { g.samples.push({ t: nowMs, d: -FALLBACK_MAGNITUDE }); visualDelta -= FALLBACK_MAGNITUDE; }
+    if (input.direction === "RIGHT") { g.samples.push({ t: nowMs, d:  FALLBACK_MAGNITUDE }); visualDelta += FALLBACK_MAGNITUDE; }
 
     const cutoff = nowMs - WINDOW_MS;
     while (g.samples.length && g.samples[0].t < cutoff) g.samples.shift();
