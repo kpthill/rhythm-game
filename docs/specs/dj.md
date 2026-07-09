@@ -108,6 +108,16 @@ density and how hard the two-hand rule works you:
    playback-rate wobble) on successful scratches; platter/lane visual response
    on spins. Better feedback generally is an open workstream.
 
+## Chart authoring (dev)
+
+"Record a take" mode (dev builds only): press **R** in-game — the song plays
+with no judging while you perform the chart on the real controls; R again (or
+song end) quantizes the take to the ½-beat grid and copies `chart.ts`-ready
+source to the clipboard (and console). Short press = tap, long press = hold,
+same-beat A+B = double, short spinner burst = scratch, sustained = spin;
+joystick L/R works as the spinner stand-in, so takes can be performed on the
+dev keyboard (left lane). See `src/games/dj/recorder.ts`.
+
 ## Cut
 
 - Crossfader moments (B held as a fader) — no appeal, cut.

@@ -15,6 +15,7 @@ import { SONG_LENGTH_BEATS } from "../../platform/song";
 import { CHART } from "./chart";
 import { sampleP2, resetP2Input, type LaneInput } from "./input2p";
 import { newGestureState, resetGestureState, sampleGesture, type GestureState, type GestureResult } from "./gesture";
+import { newRecording, recordFrame, finishRecording, type Recording, type RecordingResult } from "./recorder";
 import type { Lane, NoteEvent, ActiveNote, ScratchDir, RGB } from "./notes";
 import {
     LOOKAHEAD_BEATS, HIT_WINDOW_BEATS, PERFECT_FRACTION, SUSTAIN_GRACE_BEATS,
@@ -46,7 +47,7 @@ const VOLUME_INDICATOR_MS = 900;  // how long the indicator lingers after a chan
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-type GameState = "PLAYING" | "RESULT";
+type GameState = "PLAYING" | "RESULT" | "RECORDING" | "REC_DONE";
 
 interface Judgment { text: string; frame: number; }
 
@@ -82,6 +83,13 @@ let leftState: LaneState;
 let rightState: LaneState;
 
 let volumeShownAtMs = -Infinity;
+
+// Chart recorder (dev-only; see recorder.ts)
+let recording: Recording | null = null;
+let recResult: RecordingResult | null = null;
+let recClipboardOk = false;
+let recPrevWholeBeat = -1;
+let recKeyHandler: ((e: KeyboardEvent) => void) | null = null;
 
 function newLaneState(lane: Lane): LaneState {
     return {
@@ -686,6 +694,139 @@ function frameResult(input: InputSnapshot): void {
     if (input.aPressed) resetGame();
 }
 
+// ── Screen: RECORDING (dev-only chart authoring — see recorder.ts) ───────────
+
+function startRecording(): void {
+    recording = newRecording();
+    recResult = null;
+    recClipboardOk = false;
+    recPrevWholeBeat = -1;
+    ctx.audio.stop();
+    state = "RECORDING";
+    void ctx.audio.play(0);
+}
+
+function stopRecording(): void {
+    if (!recording) return;
+    recResult = finishRecording(recording, ctx.beatNow());
+    recording = null;
+    ctx.audio.stop();
+    state = "REC_DONE";
+
+    console.log("[dj recorder]\n" + recResult.source);
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(recResult.source)
+            .then(() => { recClipboardOk = true; })
+            .catch(() => {});
+    }
+}
+
+/** Short metronome blip (through the master gain, so volume applies). */
+function tickMetronome(accent: boolean): void {
+    const audioCtx = ctx.audio.context;
+    const now  = audioCtx.currentTime;
+    const osc  = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "square";
+    osc.frequency.value = accent ? 1320 : 880;
+    gain.gain.setValueAtTime(accent ? 0.1 : 0.06, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
+    osc.connect(gain).connect(ctx.audio.output);
+    osc.start(now);
+    osc.stop(now + 0.05);
+}
+
+function frameRecording(input: InputSnapshot): void {
+    const rec = recording;
+    if (!rec) { state = "PLAYING"; return; }
+    const cb = ctx.beatNow();
+
+    recordFrame(rec, rec.left,  laneInputFromP1(input), cb);
+    recordFrame(rec, rec.right, sampleP2(), cb);
+
+    const whole = Math.floor(cb);
+    if (cb >= 0 && whole !== recPrevWholeBeat) {
+        recPrevWholeBeat = whole;
+        tickMetronome(whole % 4 === 0);
+    }
+
+    drawBackground();
+
+    // Beat flash + pulsing REC badge
+    if (cb >= 0 && cb - whole < 0.15) {
+        p.noStroke();
+        p.fill(255, 255, 255, 22);
+        p.rect(0, 0, W, H);
+    }
+    const pulse = (Math.sin(p.millis() / 250) + 1) / 2;
+    p.noStroke();
+    p.fill(235, 50 + pulse * 50, 60);
+    p.ellipse(14, 14, 9, 9);
+    p.fill(240, 230, 250);
+    p.textAlign(p.LEFT, p.CENTER);
+    p.textSize(9);
+    p.text("REC", 22, 14);
+
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(7);
+    p.fill(150, 140, 190);
+    p.text(`L ${rec.left.notes.length}   ·   R ${rec.right.notes.length}`, W / 2, 14);
+
+    p.textAlign(p.RIGHT, p.CENTER);
+    p.textSize(8);
+    p.fill(160, 150, 200);
+    p.text(`♪ ${Math.max(0, whole)}`, W - 6, 14);
+
+    // Recent captures, newest brightest
+    p.textAlign(p.LEFT, p.TOP);
+    p.textSize(6.5);
+    for (let i = 0; i < rec.log.length; i++) {
+        p.fill(190, 180, 230, 90 + (i / Math.max(1, rec.log.length - 1)) * 165);
+        p.text(rec.log[i], 10, 34 + i * 10);
+    }
+
+    p.textAlign(p.CENTER, p.BOTTOM);
+    p.textSize(6.5);
+    p.fill(120, 110, 150);
+    p.text("perform the take — R = stop & copy", W / 2, H - 6);
+
+    if (cb >= SONG_LENGTH_BEATS) stopRecording();
+}
+
+function frameRecDone(input: InputSnapshot): void {
+    drawBackground();
+    const cx = W / 2;
+    const cy = H / 2;
+
+    p.noStroke();
+    p.fill(25, 20, 45);
+    p.rect(cx - 110, cy - 50, 220, 100, 8);
+    p.stroke(235, 80, 80);
+    p.strokeWeight(1.5);
+    p.noFill();
+    p.rect(cx - 110, cy - 50, 220, 100, 8);
+
+    p.noStroke();
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(15);
+    p.fill(240, 230, 250);
+    p.text("TAKE CAPTURED", cx, cy - 28);
+
+    p.textSize(9);
+    p.fill(190, 180, 230);
+    p.text(`${recResult?.leftCount ?? 0} left  ·  ${recResult?.rightCount ?? 0} right`, cx, cy - 8);
+
+    p.textSize(7);
+    p.fill(140, 210, 160);
+    p.text(recClipboardOk ? "copied to clipboard (also in console)" : "in the console (clipboard unavailable)", cx, cy + 10);
+
+    p.textSize(7);
+    p.fill(110, 100, 140);
+    p.text("R = record again   ·   A = play   ·   hold START = exit", cx, cy + 32);
+
+    if (input.aPressed) resetGame();
+}
+
 // ── Module ───────────────────────────────────────────────────────────────────
 
 const dj: GameModule = {
@@ -697,16 +838,33 @@ const dj: GameModule = {
         ctx = c;
         p   = c.p;
         resetGame();
+
+        // Dev-only chart recorder: R toggles record mode (cabinet has no keyboard).
+        if (import.meta.env.DEV) {
+            recKeyHandler = (e: KeyboardEvent) => {
+                if (e.repeat || (e.key !== "r" && e.key !== "R")) return;
+                if (state === "RECORDING") stopRecording();
+                else startRecording();
+            };
+            window.addEventListener("keydown", recKeyHandler);
+        }
     },
 
     frame(input: InputSnapshot, _dt: number): void {
         switch (state) {
-            case "PLAYING": framePlaying(input); break;
-            case "RESULT":  frameResult(input);  break;
+            case "PLAYING":   framePlaying(input);   break;
+            case "RESULT":    frameResult(input);    break;
+            case "RECORDING": frameRecording(input); break;
+            case "REC_DONE":  frameRecDone(input);   break;
         }
     },
 
     teardown(): void {
+        if (recKeyHandler) {
+            window.removeEventListener("keydown", recKeyHandler);
+            recKeyHandler = null;
+        }
+        recording = null;
         leftState.activeNotes = [];
         leftState.judgments = [];
         rightState.activeNotes = [];
