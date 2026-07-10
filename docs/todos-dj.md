@@ -147,6 +147,10 @@ This project doubles as a test case for semi-ambitious agent-driven development.
       out, though most of the game reads fine).
 - [ ] Investigate why dj washes out on the cabinet when other games don't —
       deprioritized for now.
+- [ ] Automatic chart generation from music. Two angles: ML (à la Dance Dance
+      Convolution — learned onset/step placement), or good instructions for an
+      AI agent — how to use aubio (`tools/analyze.py` precedent) to extract beat
+      timings / onsets and generate interesting, playable step files from them.
 
 ## Suggested (Claude — take or leave)
 
