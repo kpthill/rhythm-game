@@ -714,11 +714,37 @@ function stopRecording(): void {
     state = "REC_DONE";
 
     console.log("[dj recorder]\n" + recResult.source);
+    copyTakeToClipboard();
+}
+
+/**
+ * Copy the finished take. The async clipboard API needs a secure context and
+ * clipboard-permitting frame (the rcade emulator provides neither), so fall
+ * back to execCommand("copy"), which works anywhere inside a user gesture.
+ */
+function copyTakeToClipboard(): void {
+    if (!recResult) return;
+    const text = recResult.source;
     if (navigator.clipboard) {
-        navigator.clipboard.writeText(recResult.source)
+        navigator.clipboard.writeText(text)
             .then(() => { recClipboardOk = true; })
-            .catch(() => {});
+            .catch(() => { recClipboardOk = legacyCopy(text); });
+    } else {
+        recClipboardOk = legacyCopy(text);
     }
+}
+
+function legacyCopy(text: string): boolean {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { /* not supported */ }
+    ta.remove();
+    return ok;
 }
 
 /** Short metronome blip (through the master gain, so volume applies). */
@@ -818,11 +844,11 @@ function frameRecDone(input: InputSnapshot): void {
 
     p.textSize(7);
     p.fill(140, 210, 160);
-    p.text(recClipboardOk ? "copied to clipboard (also in console)" : "in the console (clipboard unavailable)", cx, cy + 10);
+    p.text(recClipboardOk ? "copied to clipboard (also in console)" : "in the console — press C to copy", cx, cy + 10);
 
     p.textSize(7);
     p.fill(110, 100, 140);
-    p.text("R = record again   ·   A = play   ·   hold START = exit", cx, cy + 32);
+    p.text("R = record again  ·  C = copy  ·  A = play  ·  hold START = exit", cx, cy + 32);
 
     if (input.aPressed) resetGame();
 }
@@ -842,9 +868,13 @@ const dj: GameModule = {
         // Dev-only chart recorder: R toggles record mode (cabinet has no keyboard).
         if (import.meta.env.DEV) {
             recKeyHandler = (e: KeyboardEvent) => {
-                if (e.repeat || (e.key !== "r" && e.key !== "R")) return;
-                if (state === "RECORDING") stopRecording();
-                else startRecording();
+                if (e.repeat) return;
+                if (e.key === "r" || e.key === "R") {
+                    if (state === "RECORDING") stopRecording();
+                    else startRecording();
+                } else if ((e.key === "c" || e.key === "C") && state === "REC_DONE") {
+                    copyTakeToClipboard();
+                }
             };
             window.addEventListener("keydown", recKeyHandler);
         }
