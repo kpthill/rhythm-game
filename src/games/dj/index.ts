@@ -22,7 +22,7 @@ import {
     LOOKAHEAD_BEATS, HIT_WINDOW_BEATS, PERFECT_FRACTION, SUSTAIN_GRACE_BEATS,
     NOTE_TOP, HIT_Y, noteY, clampedNoteY,
     LANE_W, laneOriginX, laneCenterX, colAX, colBX,
-    NOTE_W, NOTE_H, SCRATCH_R, HOLD_TAIL_W,
+    NOTE_W, NOTE_H, SCRATCH_R, SCRATCH_BAR_H, HOLD_TAIL_W,
     COLOR_A, COLOR_B, COLOR_SCRATCH_CW, COLOR_SCRATCH_CCW, COLOR_SPIN,
     lerpColor,
 } from "./notes";
@@ -52,6 +52,15 @@ type GameState = "PLAYING" | "RESULT" | "RECORDING" | "REC_DONE";
 
 interface Judgment { text: string; frame: number; }
 
+/** A brief flash on the hit line where a note was judged. */
+interface HitFlash {
+    x: number;
+    w: number;
+    frame: number;
+    kind: "perfect" | "good" | "miss";
+    color: RGB;
+}
+
 interface LaneState {
     lane: Lane;
     activeNotes: ActiveNote[];
@@ -59,11 +68,14 @@ interface LaneState {
     gesture: GestureState;
     platterAngle: number;
     platterSpeed: number;
+    /** Platter rim flashes briefly after a correct spinner hit. */
+    platterFlashFrame: number;
     prevBothHeld: boolean;
     /** 0..1 — ramps up while a spin note is actively sustaining; tints the whole stream. */
     tint: number;
     lastGesture: GestureResult | null;
     judgments: Judgment[];
+    hitFlashes: HitFlash[];
 }
 
 const LANE_EVENTS: Record<Lane, NoteEvent[]> = {
@@ -85,6 +97,9 @@ let rightState: LaneState;
 
 let volumeShownAtMs = -Infinity;
 
+// Count-in bookkeeping (metronome ticks on beats -4..-1 before the first notes)
+let prevPlayWholeBeat = 999;
+
 // Chart recorder (dev-only; see recorder.ts)
 let recording: Recording | null = null;
 let recResult: RecordingResult | null = null;
@@ -100,10 +115,12 @@ function newLaneState(lane: Lane): LaneState {
         gesture: newGestureState(),
         platterAngle: 0,
         platterSpeed: 0,
+        platterFlashFrame: -Infinity,
         prevBothHeld: false,
         tint: 0,
         lastGesture: null,
         judgments: [],
+        hitFlashes: [],
     };
 }
 
@@ -111,6 +128,36 @@ function newLaneState(lane: Lane): LaneState {
 
 function pushJudgment(ls: LaneState, text: string): void {
     ls.judgments.push({ text, frame: p.frameCount });
+}
+
+/** The horizontal region a note occupies at the hit line, plus its base color. */
+function noteRegion(ls: LaneState, ev: NoteEvent): { x: number; w: number; color: RGB } {
+    const x0 = laneOriginX(ls.lane);
+    switch (ev.kind) {
+        case "tap":
+        case "hold": {
+            const cx = ev.button === "B" ? colBX(ls.lane) : colAX(ls.lane);
+            return { x: cx - NOTE_W / 2 - 3, w: NOTE_W + 6, color: ev.button === "B" ? COLOR_B : COLOR_A };
+        }
+        case "double": {
+            const left  = colAX(ls.lane) - NOTE_W / 2 - 3;
+            const right = colBX(ls.lane) + NOTE_W / 2 + 3;
+            return { x: left, w: right - left, color: [235, 235, 255] };
+        }
+        case "scratch":
+            return { x: x0 + 2, w: LANE_W - 4, color: ev.scratch === "CCW" ? COLOR_SCRATCH_CCW : COLOR_SCRATCH_CW };
+        case "spin":
+            return { x: x0 + 2, w: LANE_W - 4, color: COLOR_SPIN };
+    }
+}
+
+/** Flash the judged note's region of the hit line (gold for PERFECT, note color for GOOD, red for MISS). */
+function pushHitFlash(ls: LaneState, ev: NoteEvent, kind: HitFlash["kind"]): void {
+    const { x, w, color } = noteRegion(ls, ev);
+    ls.hitFlashes.push({ x, w, frame: p.frameCount, kind, color });
+    if ((ev.kind === "scratch" || ev.kind === "spin") && kind !== "miss") {
+        ls.platterFlashFrame = p.frameCount;
+    }
 }
 
 function registerHit(ls: LaneState, points: number, label: string): void {
@@ -135,6 +182,7 @@ function resetGame(): void {
     life    = 1.0;
     failed  = false;
     state   = "PLAYING";
+    prevPlayWholeBeat = 999;
     void ctx.audio.play(0);
 }
 
@@ -167,11 +215,13 @@ function applyHit(ls: LaneState, note: ActiveNote, beatDiff: number): void {
     const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * PERFECT_FRACTION;
     note.result = "hit";
     registerHit(ls, perfect ? POINTS_PERFECT : POINTS_GOOD, perfect ? "PERFECT" : "GOOD");
+    pushHitFlash(ls, note.event, perfect ? "perfect" : "good");
 }
 
 function applyMiss(ls: LaneState, note: ActiveNote): void {
     note.result = "missed";
     registerMiss(ls);
+    pushHitFlash(ls, note.event, "miss");
 }
 
 /** Apply a sustain state-machine transition to the lane's scoring. */
@@ -181,14 +231,20 @@ function applySustainEvent(ls: LaneState, note: ActiveNote, event: SustainEvent)
             note.result = "hit";
             const grade = note.entryGrade ?? "GOOD";
             registerHit(ls, grade === "PERFECT" ? POINTS_PERFECT : POINTS_GOOD, grade);
+            pushHitFlash(ls, note.event, grade === "PERFECT" ? "perfect" : "good");
             break;
         }
+        case "entered":
+            // Entering a sustain is a correct input — light the line right away.
+            pushHitFlash(ls, note.event, note.entryGrade === "PERFECT" ? "perfect" : "good");
+            break;
         case "failed":
             note.result = "missed";
             registerMiss(ls);
+            pushHitFlash(ls, note.event, "miss");
             break;
         default:
-            break; // entered / lapsed / recovered: reflected visually, not scored
+            break; // lapsed / recovered: reflected on the note itself, not scored
     }
 }
 
@@ -324,23 +380,9 @@ function drawLanePanel(ls: LaneState, currentBeat: number): void {
     p.line(x0 - 2, HIT_Y, x0 + LANE_W + 2, HIT_Y);
 }
 
-/** Small CW/CCW arrow drawn inside a scratch note. */
-function drawArrow(cx: number, cy: number, dir: ScratchDir): void {
-    const r = 5;
-    p.noFill();
-    p.stroke(10, 8, 20);
-    p.strokeWeight(1.5);
-    if (dir === "CW") {
-        p.arc(cx, cy, r * 2, r * 2, Math.PI, Math.PI * 1.8);
-        p.fill(10, 8, 20);
-        p.noStroke();
-        p.triangle(cx + r * 0.6, cy + r * 0.8, cx + r * 1.1, cy + r * 0.2, cx + r * 0.0, cy + r * 0.5);
-    } else {
-        p.arc(cx, cy, r * 2, r * 2, -Math.PI * 0.2, 0);
-        p.fill(10, 8, 20);
-        p.noStroke();
-        p.triangle(cx - r * 0.6, cy + r * 0.8, cx - r * 1.1, cy + r * 0.2, cx - r * 0.0, cy + r * 0.5);
-    }
+/** A small direction chevron (▶ / ◀) used to decorate scratch bars. */
+function drawChevron(cx: number, cy: number, sign: 1 | -1, s = 3.5): void {
+    p.triangle(cx - sign * s, cy - s, cx - sign * s, cy + s, cx + sign * s, cy);
 }
 
 function drawTapNote(ev: NoteEvent, currentBeat: number, aX: number, bX: number, tint: number): void {
@@ -370,15 +412,20 @@ function drawHoldNote(ev: NoteEvent, note: ActiveNote, currentBeat: number, aX: 
     const lapsed = note.sustain === "lapsed";
     const blink  = Math.floor(p.frameCount / 4) % 2 === 0;
 
+    // Approaching holds stay BRIGHT (cabinet colors are dimmer than dev
+    // screens; a pale approach washes out). State is signalled by the
+    // boundary instead: white while approaching, gold while held.
     p.noStroke();
     if (lapsed) p.fill(235, 60, 60, blink ? 220 : 90);   // dropped: flash red, re-press to recover
-    else        p.fill(r, g, b, active ? 170 : 110);
+    else        p.fill(r, g, b, active ? 235 : 200);
     p.rect(x - HOLD_TAIL_W / 2, tailY, HOLD_TAIL_W, Math.max(0, headY - tailY), 3);
 
     if (lapsed) p.fill(235, 60, 60);
     else        p.fill(r, g, b);
-    p.stroke(255, 255, 255, active || (lapsed && blink) ? 230 : 140);
-    p.strokeWeight(1.5);
+    if (active)      p.stroke(255, 215, 90);            // held: gold boundary
+    else if (lapsed) p.stroke(255, 255, 255, blink ? 230 : 140);
+    else             p.stroke(255, 255, 255, 210);      // approaching: white boundary
+    p.strokeWeight(active ? 2.5 : 1.5);
     p.rect(x - NOTE_W / 2, headY - NOTE_H / 2, NOTE_W, NOTE_H, 4);
     p.noStroke();
     p.fill(10, 8, 20);
@@ -414,36 +461,62 @@ function drawDoubleNote(ev: NoteEvent, currentBeat: number, aX: number, bX: numb
     p.text("A+B", midX, y);
 }
 
-function drawScratchNote(ev: NoteEvent, currentBeat: number, cX: number): void {
+/** Scratch: a full-lane-width bar under the button notes — scratches can
+ *  coincide with taps/holds (other hand). Direction = color + chevrons:
+ *  CW/right = green ▶▶▶, CCW/left = yellow ◀◀◀. */
+function drawScratchBar(ev: NoteEvent, currentBeat: number, x0: number): void {
     const y = clampedNoteY(ev.beat, currentBeat);
-    if (y < NOTE_TOP - SCRATCH_R || y > HIT_Y + SCRATCH_R) return;
+    if (y < NOTE_TOP - SCRATCH_BAR_H || y > HIT_Y + SCRATCH_BAR_H) return;
     const dir = ev.scratch ?? "CW";
     const [r, g, b] = dir === "CW" ? COLOR_SCRATCH_CW : COLOR_SCRATCH_CCW;
-    p.fill(r, g, b, 220);
-    p.stroke(255, 255, 255, 140);
-    p.strokeWeight(1.5);
-    p.ellipse(cX, y, SCRATCH_R * 2, SCRATCH_R * 2);
+
+    p.fill(r, g, b, 210);
+    p.stroke(255, 255, 255, 110);
+    p.strokeWeight(1);
+    p.rect(x0 + 2, y - SCRATCH_BAR_H / 2, LANE_W - 4, SCRATCH_BAR_H, 3);
+
     p.noStroke();
     p.fill(10, 8, 20);
-    drawArrow(cX, y, dir);
+    const sign = dir === "CW" ? 1 : -1;
+    for (let i = 1; i <= 4; i++) {
+        drawChevron(x0 + (LANE_W * i) / 5, y, sign);
+    }
 }
 
-function drawSpinNote(ev: NoteEvent, note: ActiveNote, currentBeat: number, cX: number, health: number): void {
+/** Spin: lights up the whole track for its duration — a translucent full-width
+ *  region with edge rails, a strongly decorated onset bar, and a spoked badge
+ *  that slows as the spin approaches a stall. */
+function drawSpinNote(ev: NoteEvent, note: ActiveNote, currentBeat: number, x0: number, cX: number, health: number): void {
     const duration = ev.durationBeats ?? 0;
     const headY = clampedNoteY(ev.beat, currentBeat);
-    const tailY = clampedNoteY(ev.beat + duration, currentBeat);
+    // The duration region extends upward from the head; keep it inside the fall area.
+    const tailY = Math.max(clampedNoteY(ev.beat + duration, currentBeat), NOTE_TOP - 4);
     const active = note.sustain === "active";
     const lapsed = note.sustain === "lapsed";
     const warn = active && health < 0.5;
     const blink = Math.floor(p.frameCount / 4) % 2 === 0;
+    const [sr, sg, sb] = COLOR_SPIN;
 
+    // Full-track duration region
     p.noStroke();
-    if (lapsed) p.fill(235, 60, 60, blink ? 160 : 70);   // stalled: flash red, fresh spin to recover
-    else        p.fill(COLOR_SPIN[0], COLOR_SPIN[1], COLOR_SPIN[2], active ? 130 : 90);
-    p.rect(cX - SCRATCH_R, tailY, SCRATCH_R * 2, Math.max(0, headY - tailY), 4);
+    if (lapsed) p.fill(235, 60, 60, blink ? 110 : 50);   // stalled: flash red, fresh spin to recover
+    else        p.fill(sr, sg, sb, active ? 80 : 45);
+    p.rect(x0 + 1, tailY, LANE_W - 2, Math.max(0, headY - tailY), 3);
 
+    // Edge rails make the continuation readable even at low alpha
+    p.stroke(lapsed ? 235 : sr, lapsed ? 60 : sg, lapsed ? 60 : sb, active || lapsed ? 200 : 130);
+    p.strokeWeight(1.5);
+    p.line(x0 + 1, tailY, x0 + 1, headY);
+    p.line(x0 + LANE_W - 1, tailY, x0 + LANE_W - 1, headY);
+
+    // Strong onset bar at the head
     const headColor: RGB = lapsed || warn ? [230, 70, 70] : COLOR_SPIN;
-    p.fill(headColor[0], headColor[1], headColor[2], lapsed && !blink ? 140 : 230);
+    p.noStroke();
+    p.fill(headColor[0], headColor[1], headColor[2], lapsed && !blink ? 150 : 235);
+    p.rect(x0 + 1, headY - 3, LANE_W - 2, 6, 2);
+
+    // Spoked badge at the center of the onset
+    p.fill(headColor[0], headColor[1], headColor[2], lapsed && !blink ? 150 : 235);
     p.stroke(255, 255, 255, lapsed && blink ? 255 : 180);
     p.strokeWeight(lapsed ? 2.5 : 1.5);
     p.ellipse(cX, headY, SCRATCH_R * 2, SCRATCH_R * 2);
@@ -473,18 +546,49 @@ function drawNotes(ls: LaneState, currentBeat: number): void {
     const aX = colAX(ls.lane);
     const bX = colBX(ls.lane);
     const cX = laneCenterX(ls.lane);
+    const x0 = laneOriginX(ls.lane);
     const health = ls.lastGesture?.spinHealth ?? 1;
+    const pending = ls.activeNotes.filter(n => n.result === "pending");
 
-    for (const note of ls.activeNotes) {
-        if (note.result !== "pending") continue;
+    // Layered: spinner-hand notes span the full track and sit UNDER the
+    // button notes — a scratch/spin can coincide with a tap/hold (other hand).
+    for (const note of pending) {
+        if (note.event.kind === "spin") drawSpinNote(note.event, note, currentBeat, x0, cX, health);
+    }
+    for (const note of pending) {
+        if (note.event.kind === "scratch") drawScratchBar(note.event, currentBeat, x0);
+    }
+    for (const note of pending) {
         const ev = note.event;
         switch (ev.kind) {
-            case "tap":     drawTapNote(ev, currentBeat, aX, bX, ls.tint); break;
-            case "hold":    drawHoldNote(ev, note, currentBeat, aX, bX, ls.tint); break;
-            case "double":  drawDoubleNote(ev, currentBeat, aX, bX, ls.tint); break;
-            case "scratch": drawScratchNote(ev, currentBeat, cX); break;
-            case "spin":    drawSpinNote(ev, note, currentBeat, cX, health); break;
+            case "tap":    drawTapNote(ev, currentBeat, aX, bX, ls.tint); break;
+            case "hold":   drawHoldNote(ev, note, currentBeat, aX, bX, ls.tint); break;
+            case "double": drawDoubleNote(ev, currentBeat, aX, bX, ls.tint); break;
         }
+    }
+}
+
+const FLASH_FRAMES = 18;
+
+/** Judgment flashes on the hit line itself — eyes are on the line during play. */
+function drawHitFlashes(ls: LaneState): void {
+    ls.hitFlashes = ls.hitFlashes.filter(f => p.frameCount - f.frame < FLASH_FRAMES);
+    for (const f of ls.hitFlashes) {
+        const age = (p.frameCount - f.frame) / FLASH_FRAMES; // 0..1
+        const fade = 1 - age;
+        const grow = 8 + age * 16;
+
+        let color: RGB;
+        let peak: number;
+        if (f.kind === "perfect")   { color = [255, 240, 140]; peak = 240; } // gold burst
+        else if (f.kind === "good") { color = f.color;          peak = 190; }
+        else                        { color = [235, 60, 60];    peak = 160; } // miss: red
+
+        p.noStroke();
+        p.fill(color[0], color[1], color[2], peak * fade * 0.45);
+        p.rect(f.x, HIT_Y - grow / 2, f.w, grow, 3);
+        p.fill(color[0], color[1], color[2], peak * fade);
+        p.rect(f.x, HIT_Y - 2, f.w, 4, 2);
     }
 }
 
@@ -497,9 +601,13 @@ function drawPlatter(ls: LaneState): void {
     p.fill(5, 4, 12, 180);
     p.ellipse(cx + 2, cy + 2, r * 2 + 3, r * 2 + 3);
 
-    const rim = lerpColor([80, 70, 110], COLOR_SPIN, ls.tint);
+    // Rim: brightens briefly after a correct spinner hit (input feedback).
+    const flashAge = p.frameCount - ls.platterFlashFrame;
+    const flash = flashAge < 12 ? 1 - flashAge / 12 : 0;
+    let rim = lerpColor([80, 70, 110], COLOR_SPIN, ls.tint);
+    rim = lerpColor(rim, [255, 250, 200], flash);
     p.stroke(rim[0], rim[1], rim[2]);
-    p.strokeWeight(2.5);
+    p.strokeWeight(2.5 + flash * 1.5);
     p.fill(18, 14, 30);
     p.ellipse(cx, cy, r * 2, r * 2);
 
@@ -521,6 +629,19 @@ function drawPlatter(ls: LaneState): void {
     p.fill(200, 190, 220);
     p.ellipse(cx, cy, 3, 3);
 
+}
+
+/** Count-in numbers (4·3·2·1) over the beats before the song's downbeat. */
+function drawCountIn(currentBeat: number): void {
+    if (currentBeat < -4 || currentBeat >= 0) return;
+    const count = -Math.floor(currentBeat);              // -4.0..-3.01 → 4, … -1.0..-0.01 → 1
+    const phase = 1 - (currentBeat - Math.floor(currentBeat)); // 1 → 0 within the beat
+    const alpha = 120 + 135 * phase;
+    p.noStroke();
+    p.fill(220, 210, 255, alpha);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(26 + 6 * phase);
+    p.text(count.toString(), W / 2, 96);
 }
 
 /** Small VOL bar top-center, shown briefly while/after P2 up/down adjusts the volume. */
@@ -630,14 +751,25 @@ function framePlaying(input: InputSnapshot): void {
     evaluateLane(leftState, cb, p1Lane, nowMs);
     evaluateLane(rightState, cb, p2Lane, nowMs);
 
+    // Count-in: four metronome ticks before beat 0 so the first notes aren't
+    // a cold open (the song has a few seconds of intro before its downbeat).
+    const whole = Math.floor(cb);
+    if (whole !== prevPlayWholeBeat) {
+        prevPlayWholeBeat = whole;
+        if (whole >= -4 && whole <= -1) tickMetronome(whole === -1);
+    }
+
     drawBackground();
     drawLanePanel(leftState, cb);
     drawLanePanel(rightState, cb);
     drawNotes(leftState, cb);
     drawNotes(rightState, cb);
+    drawHitFlashes(leftState);
+    drawHitFlashes(rightState);
     drawPlatter(leftState);
     drawPlatter(rightState);
     drawHUD(cb);
+    drawCountIn(cb);
     drawVolumeIndicator(nowMs);
 
     if (life <= 0 && !failed) {
@@ -897,8 +1029,10 @@ const dj: GameModule = {
         recording = null;
         leftState.activeNotes = [];
         leftState.judgments = [];
+        leftState.hitFlashes = [];
         rightState.activeNotes = [];
         rightState.judgments = [];
+        rightState.hitFlashes = [];
         resetGestureState(leftState.gesture);
         resetGestureState(rightState.gesture);
         ctx.audio.stop();

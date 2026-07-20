@@ -15,16 +15,20 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 ### Indicators during play
 
-- [ ] Scratches: full-track-width bars instead of circles, rendered *underneath* A/B
+- [x] Scratches: full-track-width bars instead of circles, rendered *underneath* A/B
       notes (they can coincide with button presses). Direction = color + arrow
       decoration, e.g. right scratch = green bar with right-pointing arrows.
-- [ ] Spins: light up the whole track background for the duration — strongly
-      decorated start time, clearly readable continuation.
-- [ ] All input indicators (buttons, scratches, spins, …) flash/light up on a
+- [x] Spins: light up the whole track background for the duration — strongly
+      decorated start time, clearly readable continuation. (Full-width region +
+      edge rails + onset bar + spoked badge; lane tint while sustaining.)
+- [x] All input indicators (buttons, scratches, spins, …) flash/light up on a
       correct hit; distinct color or flash effect for better-timed (PERFECT) hits.
-- [ ] Holds: bright while *approaching*, not only while held — cabinet colors are
+      (Hit-line flash in the note's region: gold burst for PERFECT, note color
+      for GOOD, red for MISS; platter rim flashes on spinner hits.)
+- [x] Holds: bright while *approaching*, not only while held — cabinet colors are
       dimmer than the dev screen and the pale scheme washes out. Consider flipping
       the state indicator: boundary color change when pressed vs. approaching.
+      (Flipped: tails stay bright; boundary white → gold while held.)
 
 ### Responsiveness
 
@@ -163,5 +167,5 @@ This project doubles as a test case for semi-ambitious agent-driven development.
 ## Suggested (Claude — take or leave)
 
 - Recorder QoL: "T = play last take" from the take-captured screen (localStorage), skip the paste round-trip while iterating on a chart.
-- Judgment feedback pass: hit/miss flash on the hit line itself, not just the floating text — eyes are on the hit line during play.
-- Count-in on game start (4 metronome ticks before beat 0) so the first notes aren't a cold open.
+- [x] Judgment feedback pass: hit/miss flash on the hit line itself, not just the floating text — eyes are on the hit line during play.
+- [x] Count-in on game start (4 metronome ticks before beat 0) so the first notes aren't a cold open.

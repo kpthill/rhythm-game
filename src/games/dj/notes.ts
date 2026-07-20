@@ -106,8 +106,9 @@ export function colBX(lane: Lane): number {
 
 export const NOTE_W = 42;
 export const NOTE_H = 12;
-export const SCRATCH_R = 16;     // radius of scratch/spin note circles
-export const HOLD_TAIL_W = 26;   // width of a hold note's tail
+export const SCRATCH_R = 16;      // radius of the spin-onset badge
+export const SCRATCH_BAR_H = 10;  // height of a full-lane scratch bar
+export const HOLD_TAIL_W = 26;    // width of a hold note's tail
 
 // ── Colors ───────────────────────────────────────────────────────────────────
 
