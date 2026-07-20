@@ -88,10 +88,11 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 - [ ] Refactor the current bag of js files into modules with clear dependencies,
       to support iterative development of everything above. (Not fully thought
       through yet — needs a design pass.)
-- [ ] Unit tests for all modules, so agents don't introduce regressions as they
-      iterate. (Needs a test runner — vitest is the natural fit with Vite;
-      pure-logic modules like gesture/recorder/chart-validation are the easy
-      first targets.)
+- [x] Unit tests for all modules, so agents don't introduce regressions as they
+      iterate. (vitest wired up as `npm test`; `npm run check` = typecheck +
+      test + build is the done-signal. Pure-logic modules covered:
+      timing, gesture, recorder, chart validation. Grow coverage as modules
+      are added/refactored.)
 
 ### Web interface
 
@@ -134,9 +135,9 @@ This project doubles as a test case for semi-ambitious agent-driven development.
       hours) instead of dying at the first limit hit.
 - [ ] Verify: when running remotely (VPS / routines / CI), what uses plan
       capacity vs. API credits?
-- [ ] Verification strategy for agent work: every task needs a machine-checkable
+- [x] Verification strategy for agent work: every task needs a machine-checkable
       done-signal (typecheck + build + unit tests + targeted checks); agents
-      don't merge/finish without it.
+      don't merge/finish without it. (`npm run check` is that signal.)
 - [ ] Work tracking: is todos.md enough, or adopt something like beads?
 
 ## Future directions

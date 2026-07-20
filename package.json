@@ -7,14 +7,18 @@
     "scripts": {
         "dev": "concurrently \"vite --port 5173 --strictPort\" \"rcade dev http://localhost:5173\"",
         "build": "vite build",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "check": "npm run typecheck && npm run test && npm run build"
     },
     "devDependencies": {
         "@types/p5": "^1.7.6",
         "concurrently": "^9.0.0",
         "rcade": "^0.0.49",
         "typescript": "^5.8.0",
-        "vite": "^7.2.4"
+        "vite": "^7.2.4",
+        "vitest": "^4.1.10"
     },
     "dependencies": {
         "@rcade/plugin-input-classic": "^0.2.1",

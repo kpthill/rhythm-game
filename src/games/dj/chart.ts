@@ -401,10 +401,15 @@ const RIGHT_REC: NoteEvent[] = [
     sc("right", 189.5, CW),
 ];
 
+/** The recorded-take chart (current default). */
 export const CHART: NoteEvent[] = [
   ...LEFT_REC, ...RIGHT_REC,
-  // ...LEFT_1, ...LEFT_2, ...LEFT_3,
-  // ...RIGHT_1, ...RIGHT_2, ...RIGHT_3,
+].sort((a, b) => a.beat - b.beat);
+
+/** The original hand-authored chart — kept as an alternate for multi-chart support. */
+export const CHART_AUTHORED: NoteEvent[] = [
+  ...LEFT_1, ...LEFT_2, ...LEFT_3,
+  ...RIGHT_1, ...RIGHT_2, ...RIGHT_3,
 ].sort((a, b) => a.beat - b.beat);
 
 // ── Dev-time two-hand-rule validator ─────────────────────────────────────────
@@ -424,7 +429,7 @@ function isButtonsGroup(ev: NoteEvent): boolean {
     return ev.kind === "tap" || ev.kind === "hold" || ev.kind === "double";
 }
 
-function validateTwoHandRule(events: NoteEvent[]): string[] {
+export function validateTwoHandRule(events: NoteEvent[]): string[] {
     const problems: string[] = [];
     const byLane: Record<Lane, NoteEvent[]> = { left: [], right: [] };
     for (const ev of events) byLane[ev.lane].push(ev);
