@@ -17,6 +17,7 @@ import { sampleP2, resetP2Input, type LaneInput } from "./input2p";
 import { newGestureState, resetGestureState, sampleGesture, type GestureState, type GestureResult } from "./gesture";
 import { stepSustain, type SustainEvent } from "./sustain";
 import { newRecording, recordFrame, finishRecording, type Recording, type RecordingResult } from "./recorder";
+import { newRunStats, accuracy, gradeRun, loadBest, saveBest, type RunStats, type BestScore, type GradeLabel } from "./score";
 import type { Lane, NoteEvent, ActiveNote, ScratchDir, RGB } from "./notes";
 import {
     LOOKAHEAD_BEATS, HIT_WINDOW_BEATS, PERFECT_FRACTION, SUSTAIN_GRACE_BEATS,
@@ -32,11 +33,19 @@ import {
 const W = 336;
 const H = 262;
 
-// Scoring (carried over from v1)
+// Scoring
 const POINTS_PERFECT = 300;
 const POINTS_GOOD    = 100;
+const STRAY_PENALTY  = 200;   // unnecessary input: hurts score, never life
+
+// DDR-like life: start at half, misses hurt, strings of good hits earn it back.
+const LIFE_START      = 0.5;
 const LIFE_MISS       = 0.08;
-const LIFE_REGAIN     = 0.012; // slow regain on successful hits
+const LIFE_REGAIN     = 0.015; // per hit, once a streak is going
+const REGAIN_MIN_COMBO = 4;    // hits needed before a streak starts regaining life
+
+/** Chart identity for best-score storage (single chart for now). */
+const CHART_ID = "mountain-king.rec";
 
 // Platter geometry (two platters, one per lane)
 const PLATTER_CY = 226;
@@ -89,8 +98,16 @@ let p: p5;
 let state: GameState = "PLAYING";
 let score  = 0;
 let combo  = 0;
-let life   = 1.0;
+let life   = LIFE_START;
 let failed = false;
+
+// Run stats + over-the-song trace for the results screen
+let stats: RunStats = newRunStats();
+let runTrace: { life: number; acc: number }[] = [];
+let lastTraceBeat = -Infinity;
+let finalGrade: GradeLabel = "D";
+let newBest = false;
+let bestScore: BestScore | null = null;
 
 let leftState: LaneState;
 let rightState: LaneState;
@@ -160,17 +177,28 @@ function pushHitFlash(ls: LaneState, ev: NoteEvent, kind: HitFlash["kind"]): voi
     }
 }
 
-function registerHit(ls: LaneState, points: number, label: string): void {
+function registerHit(ls: LaneState, perfect: boolean): void {
     combo++;
-    score += points * combo;
-    life = Math.min(1, life + LIFE_REGAIN);
-    pushJudgment(ls, label);
+    score += (perfect ? POINTS_PERFECT : POINTS_GOOD) * combo;
+    if (perfect) stats.perfect++; else stats.good++;
+    stats.maxCombo = Math.max(stats.maxCombo, combo);
+    // Life comes back through strings of good hits, not one-off pokes.
+    if (combo >= REGAIN_MIN_COMBO) life = Math.min(1, life + LIFE_REGAIN);
+    pushJudgment(ls, perfect ? "PERFECT" : "GOOD");
 }
 
 function registerMiss(ls: LaneState): void {
     combo = 0;
+    stats.missed++;
     life = Math.max(0, life - LIFE_MISS);
     pushJudgment(ls, "MISS");
+}
+
+/** Unnecessary input: costs score (never life), noted dimly. */
+function registerStray(ls: LaneState): void {
+    stats.stray++;
+    score = Math.max(0, score - STRAY_PENALTY);
+    pushJudgment(ls, "STRAY");
 }
 
 function resetGame(): void {
@@ -179,8 +207,12 @@ function resetGame(): void {
     resetP2Input();
     score   = 0;
     combo   = 0;
-    life    = 1.0;
+    life    = LIFE_START;
     failed  = false;
+    stats   = newRunStats();
+    runTrace = [];
+    lastTraceBeat = -Infinity;
+    newBest = false;
     state   = "PLAYING";
     prevPlayWholeBeat = 999;
     void ctx.audio.play(0);
@@ -214,7 +246,7 @@ function spawnNotes(ls: LaneState, currentBeat: number): void {
 function applyHit(ls: LaneState, note: ActiveNote, beatDiff: number): void {
     const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * PERFECT_FRACTION;
     note.result = "hit";
-    registerHit(ls, perfect ? POINTS_PERFECT : POINTS_GOOD, perfect ? "PERFECT" : "GOOD");
+    registerHit(ls, perfect);
     pushHitFlash(ls, note.event, perfect ? "perfect" : "good");
 }
 
@@ -229,9 +261,9 @@ function applySustainEvent(ls: LaneState, note: ActiveNote, event: SustainEvent)
     switch (event) {
         case "completed": {
             note.result = "hit";
-            const grade = note.entryGrade ?? "GOOD";
-            registerHit(ls, grade === "PERFECT" ? POINTS_PERFECT : POINTS_GOOD, grade);
-            pushHitFlash(ls, note.event, grade === "PERFECT" ? "perfect" : "good");
+            const perfect = note.entryGrade === "PERFECT";
+            registerHit(ls, perfect);
+            pushHitFlash(ls, note.event, perfect ? "perfect" : "good");
             break;
         }
         case "entered":
@@ -317,6 +349,31 @@ function evaluateLane(ls: LaneState, currentBeat: number, laneInput: LaneInput, 
         }
 
         if (ev.kind === "spin" && note.sustain === "active") spinActive = true;
+    }
+
+    // ── Stray inputs (score-only penalty) ───────────────────────────────────
+    // A press or scratch pulse with no matching note anywhere in reach.
+    // Ignored before beat 0 (players fiddle during the count-in).
+    if (currentBeat >= 0) {
+        const reachable = (n: ActiveNote): boolean => {
+            const end = n.event.beat + (n.event.durationBeats ?? 0);
+            return currentBeat >= n.event.beat - HIT_WINDOW_BEATS && currentBeat <= end + HIT_WINDOW_BEATS;
+        };
+        const buttonTarget = (button: "A" | "B"): boolean =>
+            ls.activeNotes.some(n => n.result === "pending" && reachable(n) && (
+                n.event.kind === "double" ||
+                ((n.event.kind === "tap" || n.event.kind === "hold") && n.event.button === button)
+            ));
+        const spinnerTarget = (dir: ScratchDir): boolean =>
+            ls.activeNotes.some(n => n.result === "pending" && reachable(n) && (
+                n.event.kind === "spin" ||
+                (n.event.kind === "scratch" && (n.event.scratch ?? "CW") === dir)
+            ));
+
+        if (laneInput.aPressed && !buttonTarget("A")) registerStray(ls);
+        if (laneInput.bPressed && !buttonTarget("B")) registerStray(ls);
+        if (gr.scratchCW && !spinnerTarget("CW"))   registerStray(ls);
+        if (gr.scratchCCW && !spinnerTarget("CCW")) registerStray(ls);
     }
 
     // Lane coloring: ramp the whole stream's tint toward COLOR_SPIN while a spin note sustains.
@@ -679,6 +736,7 @@ function drawJudgments(ls: LaneState): void {
         p.noStroke();
         if (j.text.startsWith("PERFECT"))  p.fill(255, 240, 80, alpha);
         else if (j.text === "GOOD")         p.fill(80, 220, 120, alpha);
+        else if (j.text === "STRAY")        p.fill(150, 140, 170, alpha * 0.8);
         else                                p.fill(255, 80, 80, alpha);
         p.text(j.text, cx, NOTE_TOP + 10 + dy);
     }
@@ -772,15 +830,30 @@ function framePlaying(input: InputSnapshot): void {
     drawCountIn(cb);
     drawVolumeIndicator(nowMs);
 
+    // Life/accuracy trace for the results graph (a sample every 2 beats).
+    if (cb >= 0 && cb - lastTraceBeat >= 2) {
+        lastTraceBeat = cb;
+        runTrace.push({ life, acc: accuracy(stats) });
+    }
+
     if (life <= 0 && !failed) {
-        failed = true;
-        ctx.audio.stop();
-        state = "RESULT";
+        finishRun(true);
+    } else if (cb >= SONG_LENGTH_BEATS) {
+        finishRun(false);
     }
-    if (cb >= SONG_LENGTH_BEATS) {
-        ctx.audio.stop();
-        state = "RESULT";
-    }
+}
+
+/** Transition to the results screen: grade the run, record bests. */
+function finishRun(died: boolean): void {
+    failed = died;
+    runTrace.push({ life, acc: accuracy(stats) });
+    finalGrade = gradeRun(stats, failed);
+    bestScore = loadBest(CHART_ID);
+    // Death doesn't set records.
+    newBest = !failed && saveBest(CHART_ID, { score, grade: finalGrade, accuracy: accuracy(stats) });
+    if (newBest) bestScore = { score, grade: finalGrade, accuracy: accuracy(stats) };
+    ctx.audio.stop();
+    state = "RESULT";
 }
 
 // ── Screen: RESULT ───────────────────────────────────────────────────────────
@@ -789,39 +862,104 @@ function frameResult(input: InputSnapshot): void {
     drawBackground();
 
     const cx = W / 2;
-    const cy = H / 2;
+    const px = cx - 152;
+    const py = 10;
+    const pw = 304;
+    const ph = 242;
 
     p.noStroke();
     p.fill(25, 20, 45);
-    p.rect(cx - 100, cy - 55, 200, 110, 8);
-    p.stroke(140, 110, 220);
+    p.rect(px, py, pw, ph, 8);
+    p.stroke(failed ? 200 : 140, failed ? 70 : 110, failed ? 70 : 220);
     p.strokeWeight(1.5);
     p.noFill();
-    p.rect(cx - 100, cy - 55, 200, 110, 8);
-
+    p.rect(px, py, pw, ph, 8);
     p.noStroke();
     p.textAlign(p.CENTER, p.CENTER);
 
-    p.textSize(22);
+    // Headline + grade (FAILED overrides everything)
+    p.textSize(18);
     p.fill(failed ? 220 : 100, failed ? 60 : 230, failed ? 60 : 120);
-    p.text(failed ? "FAIL" : "CLEAR!", cx, cy - 30);
+    p.text(failed ? "FAIL" : "CLEAR!", cx - 60, py + 22);
 
-    p.textSize(13);
+    p.textSize(failed ? 15 : 26);
+    p.fill(failed ? 220 : 255, failed ? 60 : 240, failed ? 60 : 80);
+    p.text(finalGrade, cx + 66, py + 22);
+
+    // Score + best
+    p.textSize(12);
     p.fill(220, 210, 255);
-    p.text(`SCORE  ${score.toString().padStart(7, "0")}`, cx, cy + 2);
+    p.text(`SCORE  ${score.toString().padStart(7, "0")}`, cx, py + 46);
+    p.textSize(7.5);
+    if (newBest) {
+        p.fill(255, 220, 90);
+        p.text("★ NEW BEST ★", cx, py + 60);
+    } else if (bestScore) {
+        p.fill(130, 120, 160);
+        p.text(`best ${bestScore.score.toString().padStart(7, "0")}  ·  ${bestScore.grade}`, cx, py + 60);
+    }
 
-    const grade =
-        score > 50000 ? "S" :
-        score > 30000 ? "A" :
-        score > 15000 ? "B" :
-        score > 5000  ? "C" : "D";
-    p.textSize(20);
-    p.fill(255, 240, 80);
-    p.text(grade, cx, cy + 26);
+    // Stats breakdown
+    const rows: Array<[string, string, RGB]> = [
+        ["PERFECT",   `${stats.perfect}`,  [255, 240, 80]],
+        ["GOOD",      `${stats.good}`,     [80, 220, 120]],
+        ["MISS",      `${stats.missed}`,   [255, 80, 80]],
+        ["STRAY",     `${stats.stray}`,    [150, 140, 170]],
+        ["MAX COMBO", `${stats.maxCombo}×`, [180, 160, 220]],
+        ["ACCURACY",  `${(accuracy(stats) * 100).toFixed(1)}%`, [220, 210, 255]],
+    ];
+    const statTop = py + 76;
+    for (let i = 0; i < rows.length; i++) {
+        const [label, value, color] = rows[i];
+        const y = statTop + i * 13;
+        p.textAlign(p.RIGHT, p.CENTER);
+        p.textSize(8);
+        p.fill(120, 110, 150);
+        p.text(label, cx - 8, y);
+        p.textAlign(p.LEFT, p.CENTER);
+        p.fill(color[0], color[1], color[2]);
+        p.text(value, cx + 8, y);
+    }
 
+    // Life (green) + accuracy (violet) over the song
+    const gx = px + 24;
+    const gy = statTop + rows.length * 13 + 8;
+    const gw = pw - 48;
+    const gh = 34;
+    p.noStroke();
+    p.fill(14, 11, 26);
+    p.rect(gx, gy, gw, gh, 3);
+    p.stroke(50, 42, 80);
+    p.strokeWeight(0.5);
+    p.line(gx, gy + gh / 2, gx + gw, gy + gh / 2);
+    if (runTrace.length > 1) {
+        const plot = (get: (s: { life: number; acc: number }) => number, r: number, g: number, b: number) => {
+            p.stroke(r, g, b, 220);
+            p.strokeWeight(1);
+            p.noFill();
+            p.beginShape();
+            for (let i = 0; i < runTrace.length; i++) {
+                const x = gx + (i / (runTrace.length - 1)) * gw;
+                const y = gy + gh - get(runTrace[i]) * (gh - 2) - 1;
+                p.vertex(x, y);
+            }
+            p.endShape();
+        };
+        plot(s => s.acc, 210, 120, 255);
+        plot(s => s.life, 80, 200, 120);
+    }
+    p.noStroke();
+    p.textAlign(p.LEFT, p.CENTER);
+    p.textSize(6);
+    p.fill(80, 200, 120);
+    p.text("LIFE", gx + 2, gy + 6);
+    p.fill(210, 120, 255);
+    p.text("ACC", gx + 20, gy + 6);
+
+    p.textAlign(p.CENTER, p.CENTER);
     p.textSize(8);
     p.fill(110, 100, 140);
-    p.text("A to replay   ·   hold START to exit", cx, cy + 50);
+    p.text("A to replay   ·   hold START to exit", cx, py + ph - 12);
 
     if (input.aPressed) resetGame();
 }

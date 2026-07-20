@@ -116,21 +116,28 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 ### Scoring and life
 
-- [ ] DDR-like life: start at half; lose life on misses, gain it back through
-      strings of good hits.
-- [ ] Show the score on screen during play.
-- [ ] Death = grade "FAILED", regardless of score.
-- [ ] Grades relative to the song, not raw score thresholds:
+- [x] DDR-like life: start at half; lose life on misses, gain it back through
+      strings of good hits. (Regain starts at combo ≥ 4.)
+- [x] Show the score on screen during play. (Top-right, was already there.)
+- [x] Death = grade "FAILED", regardless of score.
+- [x] Grades relative to the song, not raw score thresholds:
   - S: near-full combo, most notes properly timed.
   - A: few dropped notes (or more drops offset by a higher proportion of
     perfects).
   - B: common. C: you struggled. D: barely scraped through.
   - Maybe SS / SSS: full combo with mostly / fully perfect timings.
-- [ ] Pressing unnecessary notes hurts score but not life.
-- [ ] Results screen with run stats: life/score/accuracy graph over the song, or
+  (score.ts gradeRun over accuracy + perfect-rate + full-combo; unit-tested.)
+- [x] Pressing unnecessary notes hurts score but not life. (STRAY: −200 score,
+      dim judgment text, counted on the results screen.)
+- [x] Results screen with run stats: life/score/accuracy graph over the song, or
       counts of note types hit + accuracy breakdown (more thinking needed).
-- [ ] High scores: no DB, but hold session-scoped scores and show in song
+      (Both: PERFECT/GOOD/MISS/STRAY/max-combo/accuracy table + life & accuracy
+      traces over the song. Per-note-type breakdown could still be added.)
+- [x] High scores: no DB, but hold session-scoped scores and show in song
       select. Or localStorage — check whether the rcade cabinet persists it.
+      (Both session-scoped and localStorage behind try/catch — cabinet
+      persistence still unverified; shown on the results screen, and wired
+      for song select when that lands. Fails don't set records.)
 
 ### Agent strategy
 
