@@ -52,3 +52,40 @@ export function secondsToBeat(
     // Past all defined segments: extend with the last BPM
     return beat + (t - elapsed) * (bpms[bpms.length - 1][1] / 60);
 }
+
+/** Inverse of secondsToBeat: audio playback position where `beat` occurs.
+ *  (A beat inside a stop maps to the moment the stop begins.) */
+export function beatToSeconds(
+    beat: number,
+    offset: number,
+    bpms: BPMMap,
+    stops: StopMap,
+): number {
+    if (beat <= 0) return offset + beat * (60 / bpms[0][1]);
+
+    let elapsed = 0;
+    let cur = 0;
+
+    for (let i = 0; i < bpms.length; i++) {
+        const bpm    = bpms[i][1];
+        const segEnd = i + 1 < bpms.length ? bpms[i + 1][0] : Infinity;
+        const target = Math.min(beat, segEnd);
+
+        const segStops = (stops as Array<[number, number]>)
+            .filter(([sb]) => sb >= cur && sb < segEnd)
+            .sort((a, b) => a[0] - b[0]);
+
+        for (const [stopBeat, stopDur] of segStops) {
+            if (stopBeat >= target) break;
+            elapsed += (stopBeat - cur) * (60 / bpm);
+            elapsed += stopDur;
+            cur = stopBeat;
+        }
+
+        elapsed += (target - cur) * (60 / bpm);
+        cur = target;
+        if (cur >= beat) break;
+    }
+
+    return offset + elapsed;
+}

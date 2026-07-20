@@ -6,13 +6,17 @@
 // Five verbs: tap, hold, double (A+B), scratch (spinner pulse, direction
 // matters), spin (sustained spinner turning). See docs/specs/dj.md.
 //
-// States: PLAYING → RESULT (then A to replay).
+// States: SONG_SELECT → CHART_SELECT → PLAYING → RESULT
+// (A replays, B steps back; songs live in ./songs/<id>/, see songs/types.ts).
 
 import type p5 from "p5";
 import type { GameModule, GameContext } from "../../platform/game";
 import type { InputSnapshot } from "../../platform/input";
-import { SONG_LENGTH_BEATS } from "../../platform/song";
-import { CHART } from "./chart";
+import { AudioManager } from "../../platform/audio";
+import { secondsToBeat, beatToSeconds } from "../../platform/timing";
+import { SONGS } from "./songs/registry";
+import type { SongDef, ChartDef } from "./songs/types";
+import { chartStats } from "./chartstats";
 import { sampleP2, resetP2Input, type LaneInput } from "./input2p";
 import { newGestureState, resetGestureState, sampleGesture, type GestureState, type GestureResult } from "./gesture";
 import { stepSustain, type SustainEvent } from "./sustain";
@@ -44,8 +48,8 @@ const LIFE_MISS       = 0.08;
 const LIFE_REGAIN     = 0.015; // per hit, once a streak is going
 const REGAIN_MIN_COMBO = 4;    // hits needed before a streak starts regaining life
 
-/** Chart identity for best-score storage (single chart for now). */
-const CHART_ID = "mountain-king.rec";
+// Song select
+const PREVIEW_DELAY_MS = 500;  // linger on a song this long before its preview plays
 
 // Platter geometry (two platters, one per lane)
 const PLATTER_CY = 226;
@@ -57,7 +61,7 @@ const VOLUME_INDICATOR_MS = 900;  // how long the indicator lingers after a chan
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-type GameState = "PLAYING" | "RESULT" | "RECORDING" | "REC_DONE";
+type GameState = "SONG_SELECT" | "CHART_SELECT" | "PLAYING" | "RESULT" | "RECORDING" | "REC_DONE";
 
 interface Judgment { text: string; frame: number; }
 
@@ -87,15 +91,27 @@ interface LaneState {
     hitFlashes: HitFlash[];
 }
 
-const LANE_EVENTS: Record<Lane, NoteEvent[]> = {
-    left:  CHART.filter(e => e.lane === "left"),
-    right: CHART.filter(e => e.lane === "right"),
-};
-
 let ctx: GameContext;
 let p: p5;
 
-let state: GameState = "PLAYING";
+// DJ owns its audio (multiple songs), separate from the collection's shared
+// AudioManager so the mothballed prototypes keep their preloaded track.
+let djAudio: AudioManager;
+
+// Song/chart selection
+let songSel  = 0;
+let chartSel = 0;
+let selectedSong: SongDef | null = null;
+let selectedChart: ChartDef | null = null;
+let laneEvents: Record<Lane, NoteEvent[]> = { left: [], right: [] };
+let navLatch = false;
+
+// Preview playback (song select)
+let previewToken = 0;
+let previewReady = false;
+let previewStartMs = 0;
+
+let state: GameState = "SONG_SELECT";
 let score  = 0;
 let combo  = 0;
 let life   = LIFE_START;
@@ -201,7 +217,23 @@ function registerStray(ls: LaneState): void {
     pushJudgment(ls, "STRAY");
 }
 
+/** Current beat of the selected song, from DJ's own audio clock. */
+function songBeatNow(): number {
+    if (!selectedSong) return 0;
+    return secondsToBeat(djAudio.currentSeconds, selectedSong.offset, selectedSong.bpms, selectedSong.stops);
+}
+
+/** Best-score key for the current song+chart. */
+function chartKey(): string {
+    return `${selectedSong?.id ?? "?"}.${selectedChart?.id ?? "?"}`;
+}
+
 function resetGame(): void {
+    if (!selectedSong || !selectedChart) { state = "SONG_SELECT"; return; }
+    laneEvents = {
+        left:  selectedChart.events.filter(e => e.lane === "left"),
+        right: selectedChart.events.filter(e => e.lane === "right"),
+    };
     leftState  = newLaneState("left");
     rightState = newLaneState("right");
     resetP2Input();
@@ -215,7 +247,8 @@ function resetGame(): void {
     newBest = false;
     state   = "PLAYING";
     prevPlayWholeBeat = 999;
-    void ctx.audio.play(0);
+    djAudio.stop();
+    void djAudio.play(0);
 }
 
 function laneInputFromP1(input: InputSnapshot): LaneInput {
@@ -233,7 +266,7 @@ function laneInputFromP1(input: InputSnapshot): LaneInput {
 // ── Game logic ───────────────────────────────────────────────────────────────
 
 function spawnNotes(ls: LaneState, currentBeat: number): void {
-    const events = LANE_EVENTS[ls.lane];
+    const events = laneEvents[ls.lane];
     while (ls.chartIndex < events.length) {
         const ev = events[ls.chartIndex];
         if (currentBeat >= ev.beat - LOOKAHEAD_BEATS) {
@@ -280,9 +313,9 @@ function applySustainEvent(ls: LaneState, note: ActiveNote, event: SustainEvent)
     }
 }
 
-/** Brief synthesized scratch blip — no audio asset needed, built on the shared AudioContext. */
+/** Brief synthesized scratch blip — no audio asset needed, built on DJ's AudioContext. */
 function triggerScratchFX(dir: ScratchDir): void {
-    const audioCtx = ctx.audio.context;
+    const audioCtx = djAudio.context;
     const now = audioCtx.currentTime;
     const osc  = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
@@ -293,7 +326,7 @@ function triggerScratchFX(dir: ScratchDir): void {
     osc.frequency.exponentialRampToValueAtTime(endFreq, now + 0.09);
     gain.gain.setValueAtTime(0.16, now);
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
-    osc.connect(gain).connect(ctx.audio.output);
+    osc.connect(gain).connect(djAudio.output);
     osc.start(now);
     osc.stop(now + 0.12);
 }
@@ -721,7 +754,7 @@ function drawVolumeIndicator(nowMs: number): void {
     p.fill(60, 55, 90, alpha);
     p.rect(bx, by, bw, 5, 2);
     p.fill(140, 210, 160, alpha);
-    p.rect(bx, by, bw * ctx.audio.volume, 5, 2);
+    p.rect(bx, by, bw * djAudio.volume, 5, 2);
 }
 
 function drawJudgments(ls: LaneState): void {
@@ -787,10 +820,253 @@ function drawHUD(currentBeat: number): void {
     drawJudgments(rightState);
 }
 
+// ── Screens: SONG_SELECT / CHART_SELECT ──────────────────────────────────────
+
+/** Latched up/down navigation shared by the select screens. Returns -1/0/+1. */
+function navStep(input: InputSnapshot): number {
+    const up = input.direction === "UP" || input.direction === "UP_LEFT" || input.direction === "UP_RIGHT";
+    const dn = input.direction === "DOWN" || input.direction === "DOWN_LEFT" || input.direction === "DOWN_RIGHT";
+    if (!up && !dn) { navLatch = false; return 0; }
+    if (navLatch) return 0;
+    navLatch = true;
+    return up ? -1 : 1;
+}
+
+/** Kick off loading + (delayed) preview of the highlighted song. */
+function cueSongPreview(song: SongDef): void {
+    const token = ++previewToken;
+    previewReady = false;
+    previewStartMs = p.millis() + PREVIEW_DELAY_MS;
+    djAudio.stop();
+    void djAudio.load(song.audioFile).then(() => {
+        if (previewToken === token) previewReady = true;
+    });
+}
+
+function fmtLength(song: SongDef): string {
+    const secs = Math.max(0, beatToSeconds(song.lengthBeats, song.offset, song.bpms, song.stops));
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function fmtBpm(song: SongDef): string {
+    const values = song.bpms.map(([, bpm]) => bpm);
+    const lo = Math.round(Math.min(...values));
+    const hi = Math.round(Math.max(...values));
+    return lo === hi ? `${lo}` : `${lo}–${hi}`;
+}
+
+/** Best score across a song's charts (for the song list). */
+function songBest(song: SongDef): BestScore | null {
+    let best: BestScore | null = null;
+    for (const chart of song.charts) {
+        const b = loadBest(`${song.id}.${chart.id}`);
+        if (b && (!best || b.score > best.score)) best = b;
+    }
+    return best;
+}
+
+function drawSelectFrame(title: string, hint: string): void {
+    drawBackground();
+    p.noStroke();
+    p.textAlign(p.CENTER, p.CENTER);
+    p.fill(220, 210, 255);
+    p.textSize(13);
+    p.text(title, W / 2, 20);
+    p.fill(90, 82, 118);
+    p.textSize(7);
+    p.text(hint, W / 2, H - 10);
+}
+
+function frameSongSelect(input: InputSnapshot): void {
+    const n = SONGS.length;
+    if (n === 0) {
+        drawSelectFrame("SELECT SONG", "");
+        p.fill(200, 100, 100);
+        p.textSize(10);
+        p.text("No songs found", W / 2, 120);
+        return;
+    }
+
+    const step = navStep(input);
+    if (step !== 0) {
+        songSel = (songSel + step + n) % n;
+        cueSongPreview(SONGS[songSel]);
+    }
+    const song = SONGS[songSel];
+
+    // Delayed preview once the audio is decoded
+    if (previewReady && !djAudio.playing && p.millis() >= previewStartMs) {
+        void djAudio.play(song.previewSeconds ?? song.offset);
+    }
+
+    drawSelectFrame("SELECT SONG", "UP/DOWN — browse   ·   A / START — choose");
+
+    // Song list (left column)
+    p.textAlign(p.LEFT, p.CENTER);
+    const listTop = 44;
+    for (let i = 0; i < n; i++) {
+        const y = listTop + i * 20;
+        const sel = i === songSel;
+        if (sel) {
+            p.noStroke();
+            p.fill(40, 30, 70);
+            p.rect(8, y - 8, 172, 17, 3);
+        }
+        p.fill(sel ? 235 : 130, sel ? 220 : 122, sel ? 255 : 160);
+        p.textSize(sel ? 9.5 : 8.5);
+        p.text((sel ? "▶ " : "  ") + song0Title(SONGS[i]), 14, y);
+    }
+
+    // Info panel (right column)
+    const ix = 192;
+    p.noStroke();
+    p.fill(20, 16, 36);
+    p.rect(ix - 4, 40, W - ix - 6, 150, 4);
+    p.textAlign(p.LEFT, p.TOP);
+    p.fill(235, 225, 255);
+    p.textSize(8.5);
+    p.text(wrapText(song.title, 24), ix + 4, 48);
+    p.fill(140, 130, 170);
+    p.textSize(7);
+    p.text(song.artist, ix + 4, 74);
+
+    p.fill(170, 160, 200);
+    p.textSize(7.5);
+    p.text(`♪ ${fmtBpm(song)} BPM`, ix + 4, 94);
+    p.text(`⏱ ${fmtLength(song)}`, ix + 4, 108);
+    p.text(`${song.charts.length} chart${song.charts.length === 1 ? "" : "s"}`, ix + 4, 122);
+
+    const best = songBest(song);
+    if (best) {
+        p.fill(255, 220, 90);
+        p.text(`best ${best.score.toString().padStart(7, "0")} · ${best.grade}`, ix + 4, 140);
+    }
+
+    if (djAudio.playing) {
+        p.fill(120, 200, 150);
+        p.textSize(6.5);
+        p.text("♫ preview", ix + 4, 172);
+    }
+
+    if (input.aPressed || input.startPressed) {
+        chartSel = 0;
+        navLatch = true; // don't carry a held direction into the next screen
+        state = "CHART_SELECT";
+    }
+}
+
+/** First line of a song title, truncated for the list column. */
+function song0Title(song: SongDef): string {
+    return song.title.length > 26 ? song.title.slice(0, 25) + "…" : song.title;
+}
+
+/** Naive wrap: break a string into lines of at most `chars`. */
+function wrapText(text: string, chars: number): string {
+    const words = text.split(" ");
+    const lines: string[] = [];
+    let cur = "";
+    for (const w of words) {
+        if (cur && (cur + " " + w).length > chars) { lines.push(cur); cur = w; }
+        else cur = cur ? cur + " " + w : w;
+    }
+    if (cur) lines.push(cur);
+    return lines.join("\n");
+}
+
+function frameChartSelect(input: InputSnapshot): void {
+    const song = SONGS[songSel];
+    if (!song) { state = "SONG_SELECT"; return; }
+    const n = song.charts.length;
+
+    const step = navStep(input);
+    if (step !== 0) chartSel = (chartSel + step + n) % n;
+    const chart = song.charts[chartSel];
+    const cs = chartStats(chart.events, song.lengthBeats);
+
+    // Preview keeps playing from song select; late-arriving decode still starts it.
+    if (previewReady && !djAudio.playing && p.millis() >= previewStartMs) {
+        void djAudio.play(song.previewSeconds ?? song.offset);
+    }
+
+    drawSelectFrame(song0Title(song), "UP/DOWN — chart   ·   A / START — play   ·   B — back");
+
+    // Chart list
+    p.textAlign(p.LEFT, p.CENTER);
+    const listTop = 48;
+    for (let i = 0; i < n; i++) {
+        const y = listTop + i * 20;
+        const sel = i === chartSel;
+        const c = song.charts[i];
+        if (sel) {
+            p.noStroke();
+            p.fill(40, 30, 70);
+            p.rect(8, y - 8, 164, 17, 3);
+        }
+        p.fill(sel ? 235 : 130, sel ? 220 : 122, sel ? 255 : 160);
+        p.textSize(sel ? 9.5 : 8.5);
+        p.text((sel ? "▶ " : "  ") + c.name, 14, y);
+        p.textSize(7);
+        p.fill(sel ? 170 : 100, sel ? 160 : 92, sel ? 200 : 128);
+        p.textAlign(p.RIGHT, p.CENTER);
+        p.text(`${c.events.length}♪`, 168, y);
+        p.textAlign(p.LEFT, p.CENTER);
+    }
+
+    // Stats panel
+    const ix = 186;
+    p.noStroke();
+    p.fill(20, 16, 36);
+    p.rect(ix - 4, 40, W - ix - 6, 160, 4);
+    p.textAlign(p.LEFT, p.TOP);
+    p.fill(235, 225, 255);
+    p.textSize(8.5);
+    p.text(chart.name, ix + 4, 48);
+
+    const rows: Array<[string, string]> = [
+        ["notes",    `${cs.total}`],
+        ["taps",     `${cs.byKind.tap}`],
+        ["holds",    `${cs.byKind.hold}`],
+        ["doubles",  `${cs.byKind.double}`],
+        ["scratches", `${cs.byKind.scratch}`],
+        ["spins",    `${cs.byKind.spin}`],
+        ["density",  `${cs.density.toFixed(2)}/beat`],
+        ["peak",     `${cs.peakDensity.toFixed(2)}/beat`],
+    ];
+    p.textSize(6.5);
+    for (let i = 0; i < rows.length; i++) {
+        const y = 64 + i * 11;
+        p.fill(120, 110, 150);
+        p.text(rows[i][0], ix + 4, y);
+        p.fill(190, 180, 220);
+        p.text(rows[i][1], ix + 62, y);
+    }
+
+    const best = loadBest(`${song.id}.${chart.id}`);
+    if (best) {
+        p.fill(255, 220, 90);
+        p.textSize(7);
+        p.text(`best ${best.score.toString().padStart(7, "0")} · ${best.grade}`, ix + 4, 158);
+    }
+
+    if (input.bPressed) {
+        navLatch = true;
+        state = "SONG_SELECT";
+        return;
+    }
+    if (input.aPressed || input.startPressed) {
+        selectedSong = song;
+        selectedChart = chart;
+        navLatch = true;
+        resetGame();
+    }
+}
+
 // ── Screen: PLAYING ──────────────────────────────────────────────────────────
 
 function framePlaying(input: InputSnapshot): void {
-    const cb = ctx.beatNow();
+    const cb = songBeatNow();
     const nowMs = p.millis();
 
     const p1Lane = laneInputFromP1(input);
@@ -800,7 +1076,8 @@ function framePlaying(input: InputSnapshot): void {
     // as a live volume control.
     if (p2Lane.direction === "UP" || p2Lane.direction === "DOWN") {
         const dv = (p2Lane.direction === "UP" ? 1 : -1) * VOLUME_PER_SEC * (p.deltaTime / 1000);
-        ctx.audio.volume += dv;
+        djAudio.volume += dv;
+        ctx.audio.volume = djAudio.volume; // keep the collection-wide volume in sync
         volumeShownAtMs = nowMs;
     }
 
@@ -838,7 +1115,7 @@ function framePlaying(input: InputSnapshot): void {
 
     if (life <= 0 && !failed) {
         finishRun(true);
-    } else if (cb >= SONG_LENGTH_BEATS) {
+    } else if (selectedSong && cb >= selectedSong.lengthBeats) {
         finishRun(false);
     }
 }
@@ -848,11 +1125,11 @@ function finishRun(died: boolean): void {
     failed = died;
     runTrace.push({ life, acc: accuracy(stats) });
     finalGrade = gradeRun(stats, failed);
-    bestScore = loadBest(CHART_ID);
+    bestScore = loadBest(chartKey());
     // Death doesn't set records.
-    newBest = !failed && saveBest(CHART_ID, { score, grade: finalGrade, accuracy: accuracy(stats) });
+    newBest = !failed && saveBest(chartKey(), { score, grade: finalGrade, accuracy: accuracy(stats) });
     if (newBest) bestScore = { score, grade: finalGrade, accuracy: accuracy(stats) };
-    ctx.audio.stop();
+    djAudio.stop();
     state = "RESULT";
 }
 
@@ -959,9 +1236,10 @@ function frameResult(input: InputSnapshot): void {
     p.textAlign(p.CENTER, p.CENTER);
     p.textSize(8);
     p.fill(110, 100, 140);
-    p.text("A to replay   ·   hold START to exit", cx, py + ph - 12);
+    p.text("A — replay   ·   B — charts   ·   hold START — exit", cx, py + ph - 12);
 
     if (input.aPressed) resetGame();
+    else if (input.bPressed) { navLatch = true; state = "CHART_SELECT"; }
 }
 
 // ── Screen: RECORDING (dev-only chart authoring — see recorder.ts) ───────────
@@ -971,16 +1249,16 @@ function startRecording(): void {
     recResult = null;
     recClipboardOk = false;
     recPrevWholeBeat = -1;
-    ctx.audio.stop();
+    djAudio.stop();
     state = "RECORDING";
-    void ctx.audio.play(0);
+    void djAudio.play(0);
 }
 
 function stopRecording(): void {
     if (!recording) return;
-    recResult = finishRecording(recording, ctx.beatNow());
+    recResult = finishRecording(recording, songBeatNow());
     recording = null;
-    ctx.audio.stop();
+    djAudio.stop();
     state = "REC_DONE";
 
     console.log("[dj recorder]\n" + recResult.source);
@@ -1019,7 +1297,7 @@ function legacyCopy(text: string): boolean {
 
 /** Short metronome blip (through the master gain, so volume applies). */
 function tickMetronome(accent: boolean): void {
-    const audioCtx = ctx.audio.context;
+    const audioCtx = djAudio.context;
     const now  = audioCtx.currentTime;
     const osc  = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
@@ -1027,7 +1305,7 @@ function tickMetronome(accent: boolean): void {
     osc.frequency.value = accent ? 1320 : 880;
     gain.gain.setValueAtTime(accent ? 0.1 : 0.06, now);
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
-    osc.connect(gain).connect(ctx.audio.output);
+    osc.connect(gain).connect(djAudio.output);
     osc.start(now);
     osc.stop(now + 0.05);
 }
@@ -1035,7 +1313,7 @@ function tickMetronome(accent: boolean): void {
 function frameRecording(input: InputSnapshot): void {
     const rec = recording;
     if (!rec) { state = "PLAYING"; return; }
-    const cb = ctx.beatNow();
+    const cb = songBeatNow();
 
     recordFrame(rec, rec.left,  laneInputFromP1(input), cb);
     recordFrame(rec, rec.right, sampleP2(), cb);
@@ -1086,7 +1364,7 @@ function frameRecording(input: InputSnapshot): void {
     p.fill(120, 110, 150);
     p.text("perform the take — R = stop & copy", W / 2, H - 6);
 
-    if (cb >= SONG_LENGTH_BEATS) stopRecording();
+    if (selectedSong && cb >= selectedSong.lengthBeats) stopRecording();
 }
 
 function frameRecDone(input: InputSnapshot): void {
@@ -1133,7 +1411,16 @@ const dj: GameModule = {
     init(c: GameContext): void {
         ctx = c;
         p   = c.p;
-        resetGame();
+        djAudio = new AudioManager();
+        djAudio.volume = ctx.audio.volume; // inherit the collection-wide volume
+        leftState  = newLaneState("left");
+        rightState = newLaneState("right");
+        selectedSong = null;
+        selectedChart = null;
+        songSel = 0;
+        chartSel = 0;
+        state = "SONG_SELECT";
+        if (SONGS.length > 0) cueSongPreview(SONGS[0]);
 
         // Dev-only chart recorder: R toggles record mode (cabinet has no keyboard).
         if (import.meta.env.DEV) {
@@ -1141,7 +1428,7 @@ const dj: GameModule = {
                 if (e.repeat) return;
                 if (e.key === "r" || e.key === "R") {
                     if (state === "RECORDING") stopRecording();
-                    else startRecording();
+                    else if (selectedSong) startRecording();
                 } else if ((e.key === "c" || e.key === "C") && state === "REC_DONE") {
                     copyTakeToClipboard();
                 }
@@ -1152,10 +1439,12 @@ const dj: GameModule = {
 
     frame(input: InputSnapshot, _dt: number): void {
         switch (state) {
-            case "PLAYING":   framePlaying(input);   break;
-            case "RESULT":    frameResult(input);    break;
-            case "RECORDING": frameRecording(input); break;
-            case "REC_DONE":  frameRecDone(input);   break;
+            case "SONG_SELECT":  frameSongSelect(input);  break;
+            case "CHART_SELECT": frameChartSelect(input); break;
+            case "PLAYING":      framePlaying(input);     break;
+            case "RESULT":       frameResult(input);      break;
+            case "RECORDING":    frameRecording(input);   break;
+            case "REC_DONE":     frameRecDone(input);     break;
         }
     },
 
@@ -1173,7 +1462,8 @@ const dj: GameModule = {
         rightState.hitFlashes = [];
         resetGestureState(leftState.gesture);
         resetGestureState(rightState.gesture);
-        ctx.audio.stop();
+        ctx.audio.volume = djAudio.volume; // persist volume back to the collection
+        djAudio.close();
     },
 };
 

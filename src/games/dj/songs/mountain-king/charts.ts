@@ -1,20 +1,17 @@
-// DJ chart for the shared song (v2, vendored).
+// Charts for "In the Hall of the Mountain King" — two lane streams, left (P1)
+// and right (P2), authored as two parts of one arrangement.
 //
-// Two independent lane streams — left (P1) and right (P2) — authored as two
-// parts of one arrangement. Each lane showcases all five verbs (tap, hold,
-// double, scratch, spin). Two-hand rule: within a single lane, a buttons-group
-// event (tap/hold/double) never temporally overlaps a spinner-group event
-// (scratch/spin) — one hand can't do both at once. Across lanes, simultaneous
-// action is the point (that's the two-lane design), so left/right timings
-// freely overlap each other.
+// Two-hand rule: within a single lane, a buttons-group event (tap/hold/double)
+// never temporally overlaps a spinner-group event (scratch/spin) — one hand
+// can't do both at once. Across lanes, simultaneous action is the point.
+// (See ../../validate.ts; recorded takes may bend the rule.)
 //
-// Song structure (see platform/song.ts):
+// Song structure (see ./index.ts):
 //   beats   0–115.6 : 108.0 BPM opening
 //   beats 115.6–212.5: 126.6 BPM mid
 //   beats 212.5–276 : 86.3 BPM finale
 
-import type { NoteEvent, Lane, Button, ScratchDir } from "./notes";
-import { HIT_WINDOW_BEATS } from "./notes";
+import type { NoteEvent, Lane, Button, ScratchDir } from "../../notes";
 
 const tap    = (lane: Lane, beat: number, button: Button): NoteEvent => ({ lane, beat, kind: "tap", button });
 const hold   = (lane: Lane, beat: number, button: Button, durationBeats: number): NoteEvent =>
@@ -402,59 +399,12 @@ const RIGHT_REC: NoteEvent[] = [
 ];
 
 /** The recorded-take chart (current default). */
-export const CHART: NoteEvent[] = [
+export const CHART_RECORDED: NoteEvent[] = [
   ...LEFT_REC, ...RIGHT_REC,
 ].sort((a, b) => a.beat - b.beat);
 
-/** The original hand-authored chart — kept as an alternate for multi-chart support. */
+/** The original hand-authored chart. */
 export const CHART_AUTHORED: NoteEvent[] = [
   ...LEFT_1, ...LEFT_2, ...LEFT_3,
   ...RIGHT_1, ...RIGHT_2, ...RIGHT_3,
 ].sort((a, b) => a.beat - b.beat);
-
-// ── Dev-time two-hand-rule validator ─────────────────────────────────────────
-// Within a single lane, a buttons-group event's timing window must never
-// overlap a spinner-group event's window — one hand can't operate both at
-// once. This is a cheap sanity check over the authored chart, not a runtime
-// gameplay constraint.
-
-function eventSpan(ev: NoteEvent): [number, number] {
-    const isSustain = ev.kind === "hold" || ev.kind === "spin";
-    const start = ev.beat - HIT_WINDOW_BEATS;
-    const end   = ev.beat + (isSustain ? (ev.durationBeats ?? 0) : 0) + HIT_WINDOW_BEATS;
-    return [start, end];
-}
-
-function isButtonsGroup(ev: NoteEvent): boolean {
-    return ev.kind === "tap" || ev.kind === "hold" || ev.kind === "double";
-}
-
-export function validateTwoHandRule(events: NoteEvent[]): string[] {
-    const problems: string[] = [];
-    const byLane: Record<Lane, NoteEvent[]> = { left: [], right: [] };
-    for (const ev of events) byLane[ev.lane].push(ev);
-
-    for (const lane of ["left", "right"] as Lane[]) {
-        const laneEvents = [...byLane[lane]].sort((a, b) => a.beat - b.beat);
-        for (let i = 0; i < laneEvents.length; i++) {
-            for (let j = i + 1; j < laneEvents.length; j++) {
-                const a = laneEvents[i];
-                const b = laneEvents[j];
-                if (isButtonsGroup(a) === isButtonsGroup(b)) continue; // same group: no hand conflict
-                const [aStart, aEnd] = eventSpan(a);
-                const [bStart, bEnd] = eventSpan(b);
-                if (aStart < bEnd && bStart < aEnd) {
-                    problems.push(
-                        `two-hand rule violation on ${lane}: ${a.kind}@${a.beat} overlaps ${b.kind}@${b.beat}`
-                    );
-                }
-            }
-        }
-    }
-    return problems;
-}
-
-if (import.meta.env?.DEV) {
-    const problems = validateTwoHandRule(CHART);
-    for (const p of problems) console.warn(`[dj/chart] ${p}`);
-}

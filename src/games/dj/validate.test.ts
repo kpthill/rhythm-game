@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { CHART, CHART_AUTHORED, validateTwoHandRule } from "./chart";
+import { validateTwoHandRule } from "./validate";
+import { CHART_RECORDED, CHART_AUTHORED } from "./songs/mountain-king/charts";
 import type { NoteEvent } from "./notes";
 
 const tap  = (beat: number): NoteEvent => ({ lane: "left", beat, kind: "tap", button: "A" });
@@ -71,10 +72,10 @@ function checkWellFormed(chart: NoteEvent[]): void {
 }
 
 describe("shipped charts", () => {
-    it("CHART is well-formed and sorted by beat", () => {
-        checkWellFormed(CHART);
-        for (let i = 1; i < CHART.length; i++) {
-            expect(CHART[i].beat).toBeGreaterThanOrEqual(CHART[i - 1].beat);
+    it("CHART_RECORDED is well-formed and sorted by beat", () => {
+        checkWellFormed(CHART_RECORDED);
+        for (let i = 1; i < CHART_RECORDED.length; i++) {
+            expect(CHART_RECORDED[i].beat).toBeGreaterThanOrEqual(CHART_RECORDED[i - 1].beat);
         }
     });
 

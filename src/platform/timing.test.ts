@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { secondsToBeat, type BPMMap, type StopMap } from "./timing";
+import { secondsToBeat, beatToSeconds, type BPMMap, type StopMap } from "./timing";
 
 const NO_STOPS: StopMap = [];
 
@@ -84,6 +84,30 @@ describe("secondsToBeat", () => {
             // beat 2 at t=2; beat 3 at t=2.5 (120 BPM); pause to 3.5; then 120 BPM
             expect(secondsToBeat(3.0, 0, bpms2, stops2)).toBe(3);
             expect(secondsToBeat(4.0, 0, bpms2, stops2)).toBeCloseTo(4);
+        });
+    });
+
+    describe("beatToSeconds (inverse)", () => {
+        it("round-trips with secondsToBeat across BPM changes and stops", () => {
+            const bpms: BPMMap = [[0, 108.0], [115.6, 126.6], [212.5, 86.3]];
+            const stops: StopMap = [[170.1, 0.197], [192.2, 0.262], [214.7, 0.338]];
+            for (const beat of [0, 1, 50, 115.6, 116, 170, 171, 200, 212.5, 213, 270]) {
+                const t = beatToSeconds(beat, 3.174271, bpms, stops);
+                expect(secondsToBeat(t, 3.174271, bpms, stops)).toBeCloseTo(beat, 4);
+            }
+        });
+
+        it("maps beat 0 to the offset and negatives before it", () => {
+            const bpms: BPMMap = [[0, 120]];
+            expect(beatToSeconds(0, 1.5, bpms, [])).toBe(1.5);
+            expect(beatToSeconds(-2, 1.5, bpms, [])).toBeCloseTo(0.5);
+        });
+
+        it("accounts for stop durations", () => {
+            const bpms: BPMMap = [[0, 60]];
+            const stops: StopMap = [[2, 1]];
+            expect(beatToSeconds(1, 0, bpms, stops)).toBeCloseTo(1);
+            expect(beatToSeconds(3, 0, bpms, stops)).toBeCloseTo(4); // 3s of beats + 1s pause
         });
     });
 

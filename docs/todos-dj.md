@@ -67,17 +67,21 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 ### Multi-chart support
 
-- [ ] Select among multiple songs, and among multiple charts per song.
-- [ ] Reorganize songs + charts into folders (per-song directory holding audio,
-      timing data, and its charts).
+- [x] Select among multiple songs, and among multiple charts per song.
+      (SONG_SELECT → CHART_SELECT → play; B steps back.)
+- [x] Reorganize songs + charts into folders (per-song directory holding audio,
+      timing data, and its charts). (src/games/dj/songs/<id>/ auto-discovered;
+      audio under public/songs/<id>/ — mountain-king still points at the shared
+      platform asset to avoid duplicating the mp3.)
 - [ ] Select-screen niceties from other rhythm games:
-  - [ ] Song preview plays while a song is highlighted.
-  - [ ] Song info on selection: length, BPM.
-  - [ ] Chart summary stats on selection: note count, note-type breakdown,
-        note density, maybe more.
+  - [x] Song preview plays while a song is highlighted. (After a 500ms linger,
+        from the song's previewSeconds.)
+  - [x] Song info on selection: length, BPM.
+  - [x] Chart summary stats on selection: note count, note-type breakdown,
+        note density, maybe more. (Count, per-kind, avg + peak density.)
   - [ ] Eventually: a difficulty measure computed from the chart.
 - [ ] Community songs from RC folks via PR:
-  - [ ] Documentation: how to make and test a song.
+  - [x] Documentation: how to make and test a song. (docs/songs.md)
   - [ ] Clean up the tools (`tools/analyze.py` etc.) for outside users.
   - [ ] GitHub Action for song PRs — investigate an LLM reviewer that
         auto-approves recurser PRs that only add a song in the right format.
@@ -92,9 +96,11 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 - [x] Rename the game (and possibly the repo) to match its new headliner status.
       (Manifest display name is now "DJ". Repo rename needs GitHub-side action —
       left to a human.)
-- [ ] Platform separation follow-through: old song + charts move to an isolated
+- [x] Platform separation follow-through: old song + charts move to an isolated
       folder that supports the mothballed games; DJ gets the new per-song folder
-      structure (see Multi-chart support).
+      structure (see Multi-chart support). (platform/song.ts + public/audio/
+      still serve the mothballed games untouched; DJ has its own AudioManager
+      and songs/ tree.)
 - [x] Runner gets mothballed too — DJ is the sole focus. (In the vault with the
       rest.)
 

@@ -11,6 +11,8 @@ export class AudioManager {
     private masterGain: GainNode;
     private playStartContextTime = 0;
     private playStartOffset = 0;
+    /** Decoded buffers by URL, so switching between songs doesn't re-fetch. */
+    private cache = new Map<string, AudioBuffer>();
     public loaded = false;
     public playing = false;
 
@@ -20,11 +22,33 @@ export class AudioManager {
         this.masterGain.connect(this.ctx.destination);
     }
 
+    /** Load (or switch to) a track. Stops playback when switching. */
     async load(url: string): Promise<void> {
+        const cached = this.cache.get(url);
+        if (cached) {
+            if (this.buffer !== cached) this.stop();
+            this.buffer = cached;
+            this.loaded = true;
+            return;
+        }
         const response = await fetch(url);
         const arrayBuffer = await response.arrayBuffer();
-        this.buffer = await this.ctx.decodeAudioData(arrayBuffer);
+        const decoded = await this.ctx.decodeAudioData(arrayBuffer);
+        this.cache.set(url, decoded);
+        this.stop();
+        this.buffer = decoded;
         this.loaded = true;
+    }
+
+    /** Buffer duration in seconds (0 until loaded). */
+    get durationSeconds(): number {
+        return this.buffer?.duration ?? 0;
+    }
+
+    /** Release the underlying AudioContext (for per-game managers). */
+    close(): void {
+        this.stop();
+        void this.ctx.close();
     }
 
     stop(): void {
