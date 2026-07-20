@@ -115,7 +115,10 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 - [ ] Refactor the current bag of js files into modules with clear dependencies,
       to support iterative development of everything above. (Not fully thought
-      through yet — needs a design pass.)
+      through yet — needs a design pass.) (Largely happened organically: gesture /
+      sustain / score / chartstats / recorder / validate / songs-registry are now
+      pure, unit-tested modules. Remaining lump: dj/index.ts still mixes game
+      flow + rendering (~1400 lines) — split when it next gets painful.)
 - [x] Unit tests for all modules, so agents don't introduce regressions as they
       iterate. (vitest wired up as `npm test`; `npm run check` = typecheck +
       test + build is the done-signal. Pure-logic modules covered:
@@ -126,6 +129,14 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 - [ ] rcade games are playable on computers too — look into publishing this one:
       can this Vite app bundle as a static site (needed for GitHub Pages)?
+      (Investigated: yes — `vite build` already emits a fully static dist/ and
+      the game boots and renders in a plain browser (verified headlessly).
+      Three gaps before a Pages deploy is playable: (1) `base: "./"` or
+      `/rhythm-game/` in vite.config for the Pages subpath; (2) an input
+      fallback — the @rcade input plugins get their data from the cabinet/
+      emulator harness via postMessage, so a plain browser gets no input;
+      needs a dev-style keyboard shim in platform/input.ts; (3) a Pages
+      workflow. None wired up yet.)
 - [ ] Web-play niceties (open questions for later):
   - [ ] Detect touchpad swipes and interpret them as spinner moves?
   - [ ] How does the game change with only one touchpad — single-lane web
