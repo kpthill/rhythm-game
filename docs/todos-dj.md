@@ -50,11 +50,13 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 ### Spins / holds feedback
 
-- [ ] Hold release grace: ~1 beat to recover an accidentally released hold — tail
+- [x] Hold release grace: ~1 beat to recover an accidentally released hold — tail
       flashes red during the grace window; re-press within it to keep the note.
-- [ ] Spin lapse recovery: when the spin slows down (rare on cabinet) or simply
+      (sustain.ts state machine; recovery downgrades the entry grade to GOOD.)
+- [x] Spin lapse recovery: when the spin slows down (rare on cabinet) or simply
       hasn't accelerated in a while, flash and demand a fresh spin — make sustains
-      feel like an *active question*, not a passive state.
+      feel like an *active question*, not a passive state. (Lapsed spins flash
+      red + "SPIN!" and only a fresh acceleration pulse revives them.)
 - [ ] Open question: should spins always require frequent re-acceleration (a
       steady cadence of inputs), rather than only when momentum decays enough to
       register as slowing?

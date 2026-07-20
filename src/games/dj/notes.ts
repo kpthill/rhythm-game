@@ -36,8 +36,9 @@ export interface NoteEvent {
 }
 
 export type NoteResult = "pending" | "hit" | "missed";
-/** Sustain bookkeeping for hold/spin notes only. */
-export type SustainState = "idle" | "active" | "done" | "failed";
+/** Sustain bookkeeping for hold/spin notes only. "lapsed" = dropped mid-way,
+ *  inside the recovery window (flashing, waiting for a fresh input). */
+export type SustainState = "idle" | "active" | "lapsed" | "done" | "failed";
 export type Grade = "PERFECT" | "GOOD";
 
 export interface ActiveNote {
@@ -46,6 +47,8 @@ export interface ActiveNote {
     sustain?: SustainState;
     /** Grade locked in at sustain entry; applied to score when the sustain completes. */
     entryGrade?: Grade;
+    /** Beat at which the sustain lapsed (recovery window anchor). */
+    lapseStartBeat?: number;
 }
 
 // ── Canvas ───────────────────────────────────────────────────────────────────
@@ -61,6 +64,9 @@ export const PERFECT_FRACTION = 0.55;  // PERFECT under 55% of the window
 /** All-or-nothing sustain grace: dropping a hold/spin within this many beats
  *  of its natural end still counts as a completed sustain. */
 export const SUSTAIN_GRACE_BEATS = 0.25;
+/** Recovery window after accidentally dropping a hold / stalling a spin:
+ *  a fresh input within this many beats revives the sustain (at GOOD). */
+export const SUSTAIN_RECOVER_BEATS = 1.0;
 
 // ── Vertical fall geometry ───────────────────────────────────────────────────
 

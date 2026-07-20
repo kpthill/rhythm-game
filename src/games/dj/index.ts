@@ -15,6 +15,7 @@ import { SONG_LENGTH_BEATS } from "../../platform/song";
 import { CHART } from "./chart";
 import { sampleP2, resetP2Input, type LaneInput } from "./input2p";
 import { newGestureState, resetGestureState, sampleGesture, type GestureState, type GestureResult } from "./gesture";
+import { stepSustain, type SustainEvent } from "./sustain";
 import { newRecording, recordFrame, finishRecording, type Recording, type RecordingResult } from "./recorder";
 import type { Lane, NoteEvent, ActiveNote, ScratchDir, RGB } from "./notes";
 import {
@@ -173,46 +174,22 @@ function applyMiss(ls: LaneState, note: ActiveNote): void {
     registerMiss(ls);
 }
 
-/** Shared all-or-nothing sustain judging for hold/spin notes.
- *  `entryEngaged` is the timed input that starts the sustain (for spins this is
- *  a fresh acceleration pulse, not "already spinning"); `sustainEngaged` is the
- *  looser condition that keeps it alive. */
-function evaluateSustain(ls: LaneState, note: ActiveNote, currentBeat: number, beatDiff: number, entryEngaged: boolean, sustainEngaged: boolean): void {
-    const ev = note.event;
-    const endBeat = ev.beat + (ev.durationBeats ?? 0);
-
-    if (!note.sustain || note.sustain === "idle") {
-        if (entryEngaged && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
-            const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * PERFECT_FRACTION;
-            note.entryGrade = perfect ? "PERFECT" : "GOOD";
-            note.sustain = "active";
-        } else if (beatDiff > HIT_WINDOW_BEATS) {
-            note.sustain = "failed";
+/** Apply a sustain state-machine transition to the lane's scoring. */
+function applySustainEvent(ls: LaneState, note: ActiveNote, event: SustainEvent): void {
+    switch (event) {
+        case "completed": {
+            note.result = "hit";
+            const grade = note.entryGrade ?? "GOOD";
+            registerHit(ls, grade === "PERFECT" ? POINTS_PERFECT : POINTS_GOOD, grade);
+            break;
+        }
+        case "failed":
             note.result = "missed";
             registerMiss(ls);
-        }
-        return;
+            break;
+        default:
+            break; // entered / lapsed / recovered: reflected visually, not scored
     }
-
-    if (note.sustain === "active") {
-        if (currentBeat >= endBeat) {
-            completeSustain(ls, note);
-        } else if (!sustainEngaged) {
-            if (currentBeat >= endBeat - SUSTAIN_GRACE_BEATS) completeSustain(ls, note);
-            else {
-                note.sustain = "failed";
-                note.result = "missed";
-                registerMiss(ls);
-            }
-        }
-    }
-}
-
-function completeSustain(ls: LaneState, note: ActiveNote): void {
-    note.sustain = "done";
-    note.result = "hit";
-    const grade = note.entryGrade ?? "GOOD";
-    registerHit(ls, grade === "PERFECT" ? POINTS_PERFECT : POINTS_GOOD, grade);
 }
 
 /** Brief synthesized scratch blip — no audio asset needed, built on the shared AudioContext. */
@@ -271,13 +248,14 @@ function evaluateLane(ls: LaneState, currentBeat: number, laneInput: LaneInput, 
             }
             case "hold": {
                 const engaged = ev.button === "B" ? laneInput.bHeld : laneInput.aHeld;
-                evaluateSustain(ls, note, currentBeat, beatDiff, engaged, engaged);
+                applySustainEvent(ls, note, stepSustain(note, currentBeat, beatDiff, engaged, engaged));
                 break;
             }
             case "spin": {
-                // Onset is a timed input (fresh acceleration pulse); staying
-                // engaged only needs the low-bar activity detector.
-                evaluateSustain(ls, note, currentBeat, beatDiff, gr.spinPulse, gr.spinning);
+                // Onset (and recovery from a lapse) is a timed input — a fresh
+                // acceleration pulse; staying engaged only needs the low-bar
+                // activity detector.
+                applySustainEvent(ls, note, stepSustain(note, currentBeat, beatDiff, gr.spinPulse, gr.spinning));
                 break;
             }
         }
@@ -389,13 +367,17 @@ function drawHoldNote(ev: NoteEvent, note: ActiveNote, currentBeat: number, aX: 
     const x = ev.button === "B" ? bX : aX;
     const [r, g, b] = tintedColor(ev.button === "B" ? COLOR_B : COLOR_A, tint);
     const active = note.sustain === "active";
+    const lapsed = note.sustain === "lapsed";
+    const blink  = Math.floor(p.frameCount / 4) % 2 === 0;
 
     p.noStroke();
-    p.fill(r, g, b, active ? 170 : 110);
+    if (lapsed) p.fill(235, 60, 60, blink ? 220 : 90);   // dropped: flash red, re-press to recover
+    else        p.fill(r, g, b, active ? 170 : 110);
     p.rect(x - HOLD_TAIL_W / 2, tailY, HOLD_TAIL_W, Math.max(0, headY - tailY), 3);
 
-    p.fill(r, g, b);
-    p.stroke(255, 255, 255, active ? 230 : 140);
+    if (lapsed) p.fill(235, 60, 60);
+    else        p.fill(r, g, b);
+    p.stroke(255, 255, 255, active || (lapsed && blink) ? 230 : 140);
     p.strokeWeight(1.5);
     p.rect(x - NOTE_W / 2, headY - NOTE_H / 2, NOTE_W, NOTE_H, 4);
     p.noStroke();
@@ -451,17 +433,30 @@ function drawSpinNote(ev: NoteEvent, note: ActiveNote, currentBeat: number, cX: 
     const headY = clampedNoteY(ev.beat, currentBeat);
     const tailY = clampedNoteY(ev.beat + duration, currentBeat);
     const active = note.sustain === "active";
+    const lapsed = note.sustain === "lapsed";
     const warn = active && health < 0.5;
+    const blink = Math.floor(p.frameCount / 4) % 2 === 0;
 
     p.noStroke();
-    p.fill(COLOR_SPIN[0], COLOR_SPIN[1], COLOR_SPIN[2], active ? 130 : 90);
+    if (lapsed) p.fill(235, 60, 60, blink ? 160 : 70);   // stalled: flash red, fresh spin to recover
+    else        p.fill(COLOR_SPIN[0], COLOR_SPIN[1], COLOR_SPIN[2], active ? 130 : 90);
     p.rect(cX - SCRATCH_R, tailY, SCRATCH_R * 2, Math.max(0, headY - tailY), 4);
 
-    const headColor: RGB = warn ? [230, 70, 70] : COLOR_SPIN;
-    p.fill(headColor[0], headColor[1], headColor[2], 230);
-    p.stroke(255, 255, 255, 180);
-    p.strokeWeight(1.5);
+    const headColor: RGB = lapsed || warn ? [230, 70, 70] : COLOR_SPIN;
+    p.fill(headColor[0], headColor[1], headColor[2], lapsed && !blink ? 140 : 230);
+    p.stroke(255, 255, 255, lapsed && blink ? 255 : 180);
+    p.strokeWeight(lapsed ? 2.5 : 1.5);
     p.ellipse(cX, headY, SCRATCH_R * 2, SCRATCH_R * 2);
+
+    if (lapsed) {
+        // A stalled spin is an active question — demand a fresh spin.
+        p.noStroke();
+        p.fill(255, 255, 255, blink ? 255 : 180);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.textSize(7);
+        p.text("SPIN!", cX, headY);
+        return;
+    }
 
     // Rotating spokes suggest "keep spinning"; they visibly slow as `health` drops.
     p.stroke(10, 8, 20);
