@@ -85,14 +85,18 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 ### Platform
 
-- [ ] **DJ is the winner** of the multi-game experiment — make it front and
+- [x] **DJ is the winner** of the multi-game experiment — make it front and
       center: boot straight into DJ, with the other prototypes mothballed behind
-      a sub-sub-option off the main screen (kept as a novelty).
-- [ ] Rename the game (and possibly the repo) to match its new headliner status.
+      a sub-sub-option off the main screen (kept as a novelty). (Boots into DJ;
+      hold START → home screen; B → "prototype vault" with the rest.)
+- [x] Rename the game (and possibly the repo) to match its new headliner status.
+      (Manifest display name is now "DJ". Repo rename needs GitHub-side action —
+      left to a human.)
 - [ ] Platform separation follow-through: old song + charts move to an isolated
       folder that supports the mothballed games; DJ gets the new per-song folder
       structure (see Multi-chart support).
-- [ ] Runner gets mothballed too — DJ is the sole focus.
+- [x] Runner gets mothballed too — DJ is the sole focus. (In the vault with the
+      rest.)
 
 ### Productionizing
 

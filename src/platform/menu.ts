@@ -14,7 +14,7 @@ export class Menu {
     private latch = false;
     private scroll = 0;       // index of the first visible row
 
-    constructor(private p: p5, private games: GameModule[]) {}
+    constructor(private p: p5, private games: GameModule[], private title = "RHYTHM COLLECTION") {}
 
     reset(): void {
         this.latch = false;
@@ -48,10 +48,10 @@ export class Menu {
         p.textAlign(p.CENTER, p.CENTER);
         p.fill(220, 210, 255);
         p.textSize(15);
-        p.text("RHYTHM COLLECTION", W / 2, 24);
+        p.text(this.title, W / 2, 24);
         p.fill(120, 110, 150);
         p.textSize(8);
-        p.text("UP/DOWN  ·  A / START to play", W / 2, 40);
+        p.text("UP/DOWN  ·  A / START to play  ·  B to go back", W / 2, 40);
 
         if (n === 0) {
             p.fill(200, 100, 100);
