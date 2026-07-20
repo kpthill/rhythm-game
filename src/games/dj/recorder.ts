@@ -15,7 +15,7 @@
 // (mirroring gesture.ts's fallback), so a take can be performed entirely on
 // the dev keyboard.
 
-import type { Button, Lane, ScratchDir } from "./notes";
+import type { Button, Lane, NoteEvent, ScratchDir } from "./notes";
 import type { LaneInput } from "./input2p";
 
 const QUANT_BEATS       = 0.5;
@@ -54,8 +54,10 @@ export interface Recording {
 }
 
 export interface RecordingResult {
-    /** chart.ts-ready source text. */
+    /** charts.ts-ready source text. */
     source: string;
+    /** The take as playable note events (both lanes, sorted by beat). */
+    events: NoteEvent[];
     leftCount: number;
     rightCount: number;
 }
@@ -96,6 +98,21 @@ function closeSpan(rec: Recording, lr: LaneRecorder, span: Span): void {
     } else {
         pushNote(rec, lr, { beat: q(span.startBeat), kind: "scratch", dir: span.net > 0 ? "CW" : "CCW" });
     }
+}
+
+/**
+ * Punch-in: drop everything recorded at/after `beat` and clear open press/span
+ * state, so the charter can re-perform from there.
+ */
+export function truncateRecording(rec: Recording, beat: number): void {
+    for (const lr of [rec.left, rec.right]) {
+        lr.notes = lr.notes.filter(n => n.beat < beat);
+        lr.aDownBeat = null;
+        lr.bDownBeat = null;
+        lr.span = null;
+    }
+    rec.log.push(`✂ punched in at ♪${Math.round(beat * 2) / 2}`);
+    if (rec.log.length > 6) rec.log.shift();
 }
 
 /** Feed one frame of one lane's input. Call once per lane per frame while recording. */
@@ -163,6 +180,16 @@ function noteSrc(lane: Lane, n: RecNote): string {
     }
 }
 
+function toNoteEvent(lane: Lane, n: RecNote): NoteEvent {
+    switch (n.kind) {
+        case "tap":     return { lane, beat: n.beat, kind: "tap", button: n.button };
+        case "hold":    return { lane, beat: n.beat, kind: "hold", button: n.button, durationBeats: n.durationBeats };
+        case "double":  return { lane, beat: n.beat, kind: "double" };
+        case "scratch": return { lane, beat: n.beat, kind: "scratch", scratch: n.dir };
+        case "spin":    return { lane, beat: n.beat, kind: "spin", durationBeats: n.durationBeats };
+    }
+}
+
 export function finishRecording(rec: Recording, endBeat: number): RecordingResult {
     const left  = finalizeLane(rec, rec.left, endBeat);
     const right = finalizeLane(rec, rec.right, endBeat);
@@ -170,10 +197,14 @@ export function finishRecording(rec: Recording, endBeat: number): RecordingResul
         `const ${name}: NoteEvent[] = [\n${notes.map(n => `    ${noteSrc(lane, n)}`).join("\n")}\n];`;
     const source = [
         `// Recorded take — ${left.length} left / ${right.length} right events, quantized to ${QUANT_BEATS} beat.`,
-        `// Paste into chart.ts (uses its tap/hold/dbl/sc/spin helpers).`,
+        `// Paste into the song's charts.ts (uses its tap/hold/dbl/sc/spin helpers).`,
         block("LEFT_REC", "left", left),
         ``,
         block("RIGHT_REC", "right", right),
     ].join("\n");
-    return { source, leftCount: left.length, rightCount: right.length };
+    const events = [
+        ...left.map(n => toNoteEvent("left", n)),
+        ...right.map(n => toNoteEvent("right", n)),
+    ].sort((a, b) => a.beat - b.beat);
+    return { source, events, leftCount: left.length, rightCount: right.length };
 }

@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# DJ recorder takes (local authoring artifacts; promote into charts.ts to ship)
+takes/

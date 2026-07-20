@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { newRecording, recordFrame, finishRecording, type Recording, type LaneRecorder } from "./recorder";
+import { newRecording, recordFrame, finishRecording, truncateRecording, type Recording, type LaneRecorder } from "./recorder";
 import type { LaneInput } from "./input2p";
 
 // ── Simulation harness ───────────────────────────────────────────────────────
@@ -157,5 +157,36 @@ describe("recorder — lanes and output", () => {
         recordFrame(rec, rec.left, idle(), -1.9);
         const r = finishRecording(rec, 10);
         expect(r.leftCount).toBe(0);
+    });
+
+    it("emits playable events alongside the source", () => {
+        const sim = new Sim();
+        pressA(sim, 2, 2.2);
+        sim.idleUntil(4);
+        sim.frame({ spinnerDelta: 5 });
+        sim.idleUntil(6);
+        const r = sim.finish();
+        expect(r.events).toEqual([
+            { lane: "left", beat: 2, kind: "tap", button: "A" },
+            { lane: "left", beat: 4, kind: "scratch", scratch: "CW" },
+        ]);
+    });
+});
+
+describe("recorder — punch-in", () => {
+    it("truncateRecording drops notes at/after the beat and clears open state", () => {
+        const sim = new Sim();
+        pressA(sim, 2, 2.2);
+        pressA(sim, 6, 6.2);
+        sim.idleUntil(8);
+        sim.frame({ aPressed: true, aHeld: true }); // still held (open) at truncate time
+        truncateRecording(sim.rec, 5);
+        sim.beat = 5;
+        pressA(sim, 5.5, 5.7); // re-perform
+        const r = sim.finish();
+        expect(r.source).toContain(`tap("left", 2, A),`);
+        expect(r.source).not.toContain(`tap("left", 6, A),`);
+        expect(r.source).toContain(`tap("left", 5.5, A),`);
+        expect(r.leftCount).toBe(2);
     });
 });

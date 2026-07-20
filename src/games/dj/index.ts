@@ -20,7 +20,7 @@ import { chartStats } from "./chartstats";
 import { sampleP2, resetP2Input, type LaneInput } from "./input2p";
 import { newGestureState, resetGestureState, sampleGesture, type GestureState, type GestureResult } from "./gesture";
 import { stepSustain, type SustainEvent } from "./sustain";
-import { newRecording, recordFrame, finishRecording, type Recording, type RecordingResult } from "./recorder";
+import { newRecording, recordFrame, finishRecording, truncateRecording, type Recording, type RecordingResult } from "./recorder";
 import { newRunStats, accuracy, gradeRun, loadBest, saveBest, type RunStats, type BestScore, type GradeLabel } from "./score";
 import type { Lane, NoteEvent, ActiveNote, ScratchDir, RGB } from "./notes";
 import {
@@ -137,8 +137,19 @@ let prevPlayWholeBeat = 999;
 let recording: Recording | null = null;
 let recResult: RecordingResult | null = null;
 let recClipboardOk = false;
+let recSavedName: string | null = null;
 let recPrevWholeBeat = -1;
 let recKeyHandler: ((e: KeyboardEvent) => void) | null = null;
+
+// Practice tools (dev keyboard): rewind + section loop. Using either marks the
+// run as practice — no best-score records.
+let practiceMode = false;
+let loopStartBeat: number | null = null;
+let loopEndBeat: number | null = null;
+
+// Saved takes offered as extra charts on the chart-select screen (dev only)
+let devTakes: ChartDef[] = [];
+let devTakesFor = "";
 
 function newLaneState(lane: Lane): LaneState {
     return {
@@ -245,10 +256,60 @@ function resetGame(): void {
     runTrace = [];
     lastTraceBeat = -Infinity;
     newBest = false;
+    practiceMode = false;
+    loopStartBeat = null;
+    loopEndBeat = null;
     state   = "PLAYING";
     prevPlayWholeBeat = 999;
     djAudio.stop();
     void djAudio.play(0);
+}
+
+/** Jump playback to `seconds` and rebuild lane state there (practice tool). */
+function seekTo(seconds: number): void {
+    if (!selectedSong) return;
+    const target = Math.max(0, seconds);
+    djAudio.stop();
+    void djAudio.play(target);
+    const beat = secondsToBeat(target, selectedSong.offset, selectedSong.bpms, selectedSong.stops);
+    prevPlayWholeBeat = Math.floor(beat);
+    for (const ls of [leftState, rightState]) {
+        ls.activeNotes = [];
+        ls.judgments = [];
+        ls.hitFlashes = [];
+        ls.prevBothHeld = false;
+        ls.tint = 0;
+        resetGestureState(ls.gesture);
+        const events = laneEvents[ls.lane];
+        let i = 0;
+        while (i < events.length && events[i].beat < beat) i++;
+        ls.chartIndex = i;
+    }
+}
+
+/** Fetch saved takes for the chart-select screen (dev server endpoint). */
+function refreshTakes(song: SongDef): void {
+    devTakes = [];
+    devTakesFor = song.id;
+    if (!import.meta.env.DEV) return;
+    void fetch(`/__dj/takes?song=${song.id}`)
+        .then(r => r.json())
+        .then(async (data: { takes?: Array<{ name: string }> }) => {
+            if (devTakesFor !== song.id) return;
+            const takes: ChartDef[] = [];
+            for (const t of (data.takes ?? []).slice(0, 8)) {
+                const take = await (await fetch(`/__dj/takes/${song.id}/${t.name}`)).json();
+                if (Array.isArray(take.events)) {
+                    takes.push({
+                        id: `take:${t.name}`,
+                        name: t.name.replace(/^take-/, "◦ ").replace(/\.json$/, ""),
+                        events: take.events as NoteEvent[],
+                    });
+                }
+            }
+            if (devTakesFor === song.id) devTakes = takes;
+        })
+        .catch(() => { /* dev server without the endpoint — picker just stays empty */ });
 }
 
 function laneInputFromP1(input: InputSnapshot): LaneInput {
@@ -809,6 +870,16 @@ function drawHUD(currentBeat: number): void {
     p.fill(80, 75, 110);
     p.text(`♪${Math.floor(currentBeat)}`, W - 4, H - 3);
 
+    if (practiceMode || loopStartBeat !== null) {
+        p.textAlign(p.LEFT, p.BOTTOM);
+        p.textSize(6.5);
+        p.fill(230, 180, 60);
+        const loop = loopStartBeat !== null
+            ? `  LOOP ♪${loopStartBeat}–${loopEndBeat ?? "…"}`
+            : "";
+        p.text(`PRACTICE${loop}`, 4, H - 3);
+    }
+
     if (currentBeat < 5) {
         p.textAlign(p.CENTER, p.BOTTOM);
         p.textSize(6.5);
@@ -953,6 +1024,8 @@ function frameSongSelect(input: InputSnapshot): void {
     if (input.aPressed || input.startPressed) {
         chartSel = 0;
         navLatch = true; // don't carry a held direction into the next screen
+        selectedSong = song; // the song is chosen; chart select refines it (R can record now)
+        refreshTakes(song);
         state = "CHART_SELECT";
     }
 }
@@ -978,11 +1051,13 @@ function wrapText(text: string, chars: number): string {
 function frameChartSelect(input: InputSnapshot): void {
     const song = SONGS[songSel];
     if (!song) { state = "SONG_SELECT"; return; }
-    const n = song.charts.length;
+    const options = [...song.charts, ...devTakes];
+    const n = options.length;
+    chartSel = Math.min(chartSel, n - 1);
 
     const step = navStep(input);
     if (step !== 0) chartSel = (chartSel + step + n) % n;
-    const chart = song.charts[chartSel];
+    const chart = options[chartSel];
     const cs = chartStats(chart.events, song.lengthBeats);
 
     // Preview keeps playing from song select; late-arriving decode still starts it.
@@ -998,7 +1073,7 @@ function frameChartSelect(input: InputSnapshot): void {
     for (let i = 0; i < n; i++) {
         const y = listTop + i * 20;
         const sel = i === chartSel;
-        const c = song.charts[i];
+        const c = options[i];
         if (sel) {
             p.noStroke();
             p.fill(40, 30, 70);
@@ -1107,6 +1182,12 @@ function framePlaying(input: InputSnapshot): void {
     drawCountIn(cb);
     drawVolumeIndicator(nowMs);
 
+    // Section loop (practice): jump back once the end of the range passes,
+    // with a one-beat run-up.
+    if (selectedSong && loopStartBeat !== null && loopEndBeat !== null && cb >= loopEndBeat) {
+        seekTo(beatToSeconds(loopStartBeat - 1, selectedSong.offset, selectedSong.bpms, selectedSong.stops));
+    }
+
     // Life/accuracy trace for the results graph (a sample every 2 beats).
     if (cb >= 0 && cb - lastTraceBeat >= 2) {
         lastTraceBeat = cb;
@@ -1127,7 +1208,7 @@ function finishRun(died: boolean): void {
     finalGrade = gradeRun(stats, failed);
     bestScore = loadBest(chartKey());
     // Death doesn't set records.
-    newBest = !failed && saveBest(chartKey(), { score, grade: finalGrade, accuracy: accuracy(stats) });
+    newBest = !failed && !practiceMode && saveBest(chartKey(), { score, grade: finalGrade, accuracy: accuracy(stats) });
     if (newBest) bestScore = { score, grade: finalGrade, accuracy: accuracy(stats) };
     djAudio.stop();
     state = "RESULT";
@@ -1239,7 +1320,11 @@ function frameResult(input: InputSnapshot): void {
     p.text("A — replay   ·   B — charts   ·   hold START — exit", cx, py + ph - 12);
 
     if (input.aPressed) resetGame();
-    else if (input.bPressed) { navLatch = true; state = "CHART_SELECT"; }
+    else if (input.bPressed) {
+        navLatch = true;
+        if (selectedSong) refreshTakes(selectedSong);
+        state = "CHART_SELECT";
+    }
 }
 
 // ── Screen: RECORDING (dev-only chart authoring — see recorder.ts) ───────────
@@ -1263,6 +1348,27 @@ function stopRecording(): void {
 
     console.log("[dj recorder]\n" + recResult.source);
     copyTakeToClipboard();
+    saveTakeToDisk();
+}
+
+/** Persist the finished take via the dev server's takes endpoint. */
+function saveTakeToDisk(): void {
+    recSavedName = null;
+    if (!import.meta.env.DEV || !selectedSong || !recResult) return;
+    void fetch("/__dj/takes", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            songId: selectedSong.id,
+            savedAt: new Date().toISOString(),
+            counts: { left: recResult.leftCount, right: recResult.rightCount },
+            events: recResult.events,
+            source: recResult.source,
+        }),
+    })
+        .then(r => r.json())
+        .then((d: { name?: string }) => { recSavedName = d.name ?? null; })
+        .catch(() => { /* no endpoint — clipboard/console still have the take */ });
 }
 
 /**
@@ -1324,14 +1430,11 @@ function frameRecording(input: InputSnapshot): void {
         tickMetronome(whole % 4 === 0);
     }
 
+    // Beats render as lines scrolling down the lanes (same as play mode).
     drawBackground();
+    drawLanePanel(leftState, cb);
+    drawLanePanel(rightState, cb);
 
-    // Beat flash + pulsing REC badge
-    if (cb >= 0 && cb - whole < 0.15) {
-        p.noStroke();
-        p.fill(255, 255, 255, 22);
-        p.rect(0, 0, W, H);
-    }
     const pulse = (Math.sin(p.millis() / 250) + 1) / 2;
     p.noStroke();
     p.fill(235, 50 + pulse * 50, 60);
@@ -1362,7 +1465,7 @@ function frameRecording(input: InputSnapshot): void {
     p.textAlign(p.CENTER, p.BOTTOM);
     p.textSize(6.5);
     p.fill(120, 110, 150);
-    p.text("perform the take — R = stop & copy", W / 2, H - 6);
+    p.text("perform the take — R = stop & save  ·  , = punch in −10s", W / 2, H - 6);
 
     if (selectedSong && cb >= selectedSong.lengthBeats) stopRecording();
 }
@@ -1392,11 +1495,13 @@ function frameRecDone(input: InputSnapshot): void {
 
     p.textSize(7);
     p.fill(140, 210, 160);
-    p.text(recClipboardOk ? "copied to clipboard (also in console)" : "in the console — press C to copy", cx, cy + 10);
+    const saved = recSavedName ? `saved to takes/ (${recSavedName})` : null;
+    const copied = recClipboardOk ? "copied to clipboard" : "in the console — press C to copy";
+    p.text(saved ? `${saved}  ·  ${copied}` : copied, cx, cy + 10);
 
     p.textSize(7);
     p.fill(110, 100, 140);
-    p.text("R = record again  ·  C = copy  ·  A = play  ·  hold START = exit", cx, cy + 32);
+    p.text("R = re-record  ·  T = play take  ·  C = copy  ·  A = play chart", cx, cy + 32);
 
     if (input.aPressed) resetGame();
 }
@@ -1431,6 +1536,37 @@ const dj: GameModule = {
                     else if (selectedSong) startRecording();
                 } else if ((e.key === "c" || e.key === "C") && state === "REC_DONE") {
                     copyTakeToClipboard();
+                } else if ((e.key === "t" || e.key === "T") && state === "REC_DONE" && recResult && selectedSong) {
+                    // Play the take just recorded, as a chart.
+                    selectedChart = { id: "take:last", name: "last take", events: recResult.events };
+                    resetGame();
+                    practiceMode = true; // takes aren't record material
+                } else if (e.key === ",") {
+                    // Go back 10 seconds: replay (PLAYING) or punch in (RECORDING).
+                    if (state === "PLAYING" && selectedSong) {
+                        practiceMode = true;
+                        seekTo(djAudio.currentSeconds - 10);
+                    } else if (state === "RECORDING" && recording && selectedSong) {
+                        const t = Math.max(0, djAudio.currentSeconds - 10);
+                        const b = secondsToBeat(t, selectedSong.offset, selectedSong.bpms, selectedSong.stops);
+                        truncateRecording(recording, b);
+                        recPrevWholeBeat = Math.floor(b);
+                        djAudio.stop();
+                        void djAudio.play(t);
+                    }
+                } else if ((e.key === "l" || e.key === "L") && state === "PLAYING") {
+                    // Section loop: first press marks the start, second the end.
+                    const b = Math.floor(songBeatNow());
+                    if (loopStartBeat === null || loopEndBeat !== null) {
+                        loopStartBeat = b;
+                        loopEndBeat = null;
+                    } else if (b > loopStartBeat) {
+                        loopEndBeat = b;
+                        practiceMode = true;
+                    }
+                } else if (e.key === "k" || e.key === "K") {
+                    loopStartBeat = null;
+                    loopEndBeat = null;
                 }
             };
             window.addEventListener("keydown", recKeyHandler);

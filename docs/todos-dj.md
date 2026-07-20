@@ -6,12 +6,19 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 ### Recording mode
 
-- [ ] Write takes to a local directory (via a Vite dev endpoint) instead of console/clipboard.
-- [ ] Recording picker: choose among saved takes when testing.
-- [ ] "Go back 10 seconds" buttons — replay from there, or punch in and re-record from there.
-- [ ] Show beats as lines scrolling down the lanes (replace the screen-flash beat indicator).
+- [x] Write takes to a local directory (via a Vite dev endpoint) instead of console/clipboard.
+      (POST /__dj/takes → takes/<song>/<stamp>.json, gitignored; clipboard/console kept as fallback.)
+- [x] Recording picker: choose among saved takes when testing. (Saved takes show
+      up as extra rows on the chart-select screen, with stats.)
+- [x] "Go back 10 seconds" buttons — replay from there, or punch in and re-record from there.
+      (`,` = rewind 10s while playing / punch-in while recording. Dev keyboard.)
+- [x] Show beats as lines scrolling down the lanes (replace the screen-flash beat indicator).
 - [ ] Zoom-out mode: see many notes side by side; jump to a section to test or edit it.
-- [ ] Loop a section (e.g. an 8-beat range) hands-free while practicing/adjusting it.
+      (Deferred — that's a full editor UI; the picker + loop + punch-in cover the
+      iteration workflow for now.)
+- [x] Loop a section (e.g. an 8-beat range) hands-free while practicing/adjusting it.
+      (`L` marks start/end, `K` clears; loops with a one-beat run-up. Practice
+      mode — no best-score records.)
 
 ### Indicators during play
 
@@ -183,6 +190,6 @@ This project doubles as a test case for semi-ambitious agent-driven development.
 
 ## Suggested (Claude — take or leave)
 
-- Recorder QoL: "T = play last take" from the take-captured screen (localStorage), skip the paste round-trip while iterating on a chart.
+- [x] Recorder QoL: "T = play last take" from the take-captured screen (localStorage), skip the paste round-trip while iterating on a chart. (In-memory + disk takes made localStorage unnecessary.)
 - [x] Judgment feedback pass: hit/miss flash on the hit line itself, not just the floating text — eyes are on the hit line during play.
 - [x] Count-in on game start (4 metronome ticks before beat 0) so the first notes aren't a cold open.

@@ -57,8 +57,16 @@ Two ways:
 
 - **Record a take** (recommended): run `npm run dev`, pick your song, press
   `R`, and perform the chart on the controls. Stop with `R`; the take is
-  quantized to the half-beat grid and copied as paste-ready `charts.ts`
-  source. Iterate.
+  quantized to the half-beat grid and saved to `takes/<song-id>/` (also
+  copied as paste-ready `charts.ts` source). Iterate:
+  - `T` on the take-captured screen plays the take back as a chart.
+  - Saved takes appear as extra rows on the chart-select screen — pick one
+    to test it.
+  - `,` while recording punches in 10 seconds back (re-record from there);
+    `,` while playing rewinds 10s; `L` twice brackets a section loop,
+    `K` clears it. (Rewind/loop mark the run as practice — no records.)
+  - When a take is good, paste its `source` (from the JSON or clipboard)
+    into the song's `charts.ts` and add it to the SongDef.
 - **Hand-author**: write `NoteEvent`s directly (see an existing `charts.ts`
   for the `tap`/`hold`/`dbl`/`sc`/`spin` helpers).
 
