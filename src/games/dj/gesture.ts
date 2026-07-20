@@ -1,26 +1,48 @@
 // DJ game — spinner gesture detection (vendored), shared by both lanes.
 //
-// Fixes the two known v1 issues called out in the spec:
-//   1. Scratch detection was instantaneous (one frame >= 3 steps). Here we
-//      accumulate signed step delta over a short real-time window (~100ms) so
-//      a slow-but-deliberate spin still registers as a scratch.
-//   2. The joystick fallback's `flickFrames` was tracked but never consulted.
-//      Here the fallback's semantics are: a *press* feeds the same
-//      accumulator as a real scratch pulse, and *holding* the direction keeps
-//      feeding it every frame — which naturally reproduces "tap = scratch,
-//      hold = spin" without a separate timer, and drives the same stall
-//      detector spin notes need.
+// v3: scratches require **acceleration**, not just motion. On the cabinet the
+// spinner has real momentum: after one flick it keeps turning for a while, so
+// judging "is it moving?" made consecutive same-direction scratch notes free —
+// one physical input could clear several notes. Here a scratch is a *pulse
+// event* that fires only when the player actively adds energy:
 //
-// The stall detector (`lastActivityBeat`) is what spin notes use for their
-// all-or-nothing sustain: as long as the accumulated window magnitude stays
-// above a low activity bar, the spin is "alive"; once beats since the last
-// activity exceed the sustain grace, it's considered stalled.
+//   - starting from rest,
+//   - reversing direction, or
+//   - speeding up while already gliding in the same direction.
+//
+// Mechanically: signed step deltas are accumulated into two adjacent
+// real-time windows — `recent` (last WINDOW_MS) and `prior` (the WINDOW_MS
+// before that). A pulse in direction d fires on the frame where
+//     recent·d >= SCRATCH_THRESHOLD  and
+//     recent·d - max(0, prior·d) >= ACCEL_THRESHOLD
+// first becomes true (edge-triggered; the condition must lapse before the
+// same direction can fire again). A steady glide has recent ≈ prior, so no
+// acceleration and no pulse; a fresh flick puts a surge into `recent` that
+// `prior` doesn't have yet.
+//
+// Spin notes use two different signals:
+//   - onset: `spinPulse` (a pulse in either direction) — starting a spin is a
+//     *timed input*, judged like a scratch, not "was already spinning".
+//   - sustain: `spinning` — the low-bar activity detector (`lastActivityBeat`)
+//     that tolerates cabinet momentum: as long as the accumulated window
+//     magnitude stays above ACTIVITY_THRESHOLD the spin is alive, and once
+//     beats since the last activity exceed the sustain grace it has stalled.
+//
+// The joystick fallback (always active — the emulator's virtual spinner
+// reports connected, and the cabinet's always is) feeds the same accumulator
+// with a constant synthetic magnitude while LEFT/RIGHT is held. The
+// acceleration rule then gives exactly the intended fallback semantics for
+// free: pressing a direction is a surge from rest (scratch pulse), holding it
+// is steady activity (sustains a spin, no new pulses), and hitting another
+// scratch note requires releasing and pressing again. The emulator's spinner
+// keys arrive as ordinary step deltas and get the same treatment.
 
 import type { LaneInput } from "./input2p";
 
-const WINDOW_MS          = 100;  // gesture accumulation window (real time, tempo-independent)
-const SCRATCH_THRESHOLD  = 6;    // accumulated |steps| within the window to register a scratch pulse
-const ACTIVITY_THRESHOLD = 2;    // accumulated |steps| within the window to count as "still spinning"
+const WINDOW_MS          = 100;  // recent/prior accumulation window size (real time, tempo-independent)
+const SCRATCH_THRESHOLD  = 6;    // recent-window |steps| floor for a scratch pulse
+const ACCEL_THRESHOLD    = 5;    // recent must exceed same-direction prior by this many steps
+const ACTIVITY_THRESHOLD = 2;    // recent-window |steps| to count as "still spinning"
 const FALLBACK_MAGNITUDE = 4;    // synthetic per-frame step magnitude while a joystick direction is held
 
 interface Sample { t: number; d: number; }
@@ -28,20 +50,28 @@ interface Sample { t: number; d: number; }
 export interface GestureState {
     samples: Sample[];
     lastActivityBeat: number;
+    /** Edge-detection: whether each direction's pulse condition held last frame. */
+    prevCondCW: boolean;
+    prevCondCCW: boolean;
 }
 
 export function newGestureState(): GestureState {
-    return { samples: [], lastActivityBeat: -Infinity };
+    return { samples: [], lastActivityBeat: -Infinity, prevCondCW: false, prevCondCCW: false };
 }
 
 export function resetGestureState(g: GestureState): void {
     g.samples.length = 0;
     g.lastActivityBeat = -Infinity;
+    g.prevCondCW = false;
+    g.prevCondCCW = false;
 }
 
 export interface GestureResult {
+    /** Pulse events — fire on exactly one frame per physical acceleration. */
     scratchCW: boolean;
     scratchCCW: boolean;
+    /** Direction-agnostic pulse (either scratch direction) — a spin note's onset input. */
+    spinPulse: boolean;
     /** Continuous spinning right now — feeds spin-note sustain + stall visuals. */
     spinning: boolean;
     /** 1 = actively spinning, decays toward 0 as a stall approaches (for slow-down feedback). */
@@ -61,29 +91,42 @@ export function sampleGesture(
     let visualDelta = input.spinnerDelta;
     if (input.spinnerDelta !== 0) g.samples.push({ t: nowMs, d: input.spinnerDelta });
 
-    // Joystick fallback — ALWAYS active per the spec, not just when the spinner is
-    // disconnected (the emulator's virtual spinner reports connected, and the cabinet's
-    // always is). Holding a direction feeds the accumulator every frame, so a quick tap
-    // crosses SCRATCH_THRESHOLD almost immediately (a "scratch") while only a sustained
-    // hold keeps `lastActivityBeat` fresh long enough to satisfy a spin note.
+    // Joystick fallback: holding a direction feeds a constant synthetic rate.
     if (input.direction === "LEFT")  { g.samples.push({ t: nowMs, d: -FALLBACK_MAGNITUDE }); visualDelta -= FALLBACK_MAGNITUDE; }
     if (input.direction === "RIGHT") { g.samples.push({ t: nowMs, d:  FALLBACK_MAGNITUDE }); visualDelta += FALLBACK_MAGNITUDE; }
 
-    const cutoff = nowMs - WINDOW_MS;
-    while (g.samples.length && g.samples[0].t < cutoff) g.samples.shift();
+    // Keep two windows' worth of samples: recent (now-W, now] and prior (now-2W, now-W].
+    const cutoff = nowMs - WINDOW_MS * 2;
+    while (g.samples.length && g.samples[0].t <= cutoff) g.samples.shift();
 
-    let sum = 0;
-    for (const s of g.samples) sum += s.d;
+    let recent = 0;
+    let prior  = 0;
+    const windowEdge = nowMs - WINDOW_MS;
+    for (const s of g.samples) {
+        if (s.t > windowEdge) recent += s.d;
+        else prior += s.d;
+    }
 
-    if (Math.abs(sum) >= ACTIVITY_THRESHOLD) g.lastActivityBeat = currentBeat;
+    if (Math.abs(recent) >= ACTIVITY_THRESHOLD) g.lastActivityBeat = currentBeat;
+
+    // Acceleration test per direction: the recent rate must clear the scratch
+    // floor AND meaningfully exceed what was already flowing in that direction.
+    const condCW  =  recent >= SCRATCH_THRESHOLD &&  recent - Math.max(0,  prior) >= ACCEL_THRESHOLD;
+    const condCCW = -recent >= SCRATCH_THRESHOLD && -recent - Math.max(0, -prior) >= ACCEL_THRESHOLD;
+
+    const scratchCW  = condCW  && !g.prevCondCW;
+    const scratchCCW = condCCW && !g.prevCondCCW;
+    g.prevCondCW  = condCW;
+    g.prevCondCCW = condCCW;
 
     const beatsSinceActivity = currentBeat - g.lastActivityBeat;
     const spinHealth = Math.max(0, 1 - beatsSinceActivity / stallGraceBeats);
     const spinning = beatsSinceActivity <= stallGraceBeats;
 
     return {
-        scratchCW:  sum >= SCRATCH_THRESHOLD,
-        scratchCCW: sum <= -SCRATCH_THRESHOLD,
+        scratchCW,
+        scratchCCW,
+        spinPulse: scratchCW || scratchCCW,
         spinning,
         spinHealth,
         visualDelta,

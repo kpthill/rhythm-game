@@ -173,13 +173,16 @@ function applyMiss(ls: LaneState, note: ActiveNote): void {
     registerMiss(ls);
 }
 
-/** Shared all-or-nothing sustain judging for hold/spin notes. */
-function evaluateSustain(ls: LaneState, note: ActiveNote, currentBeat: number, beatDiff: number, engaged: boolean): void {
+/** Shared all-or-nothing sustain judging for hold/spin notes.
+ *  `entryEngaged` is the timed input that starts the sustain (for spins this is
+ *  a fresh acceleration pulse, not "already spinning"); `sustainEngaged` is the
+ *  looser condition that keeps it alive. */
+function evaluateSustain(ls: LaneState, note: ActiveNote, currentBeat: number, beatDiff: number, entryEngaged: boolean, sustainEngaged: boolean): void {
     const ev = note.event;
     const endBeat = ev.beat + (ev.durationBeats ?? 0);
 
     if (!note.sustain || note.sustain === "idle") {
-        if (engaged && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
+        if (entryEngaged && Math.abs(beatDiff) <= HIT_WINDOW_BEATS) {
             const perfect = Math.abs(beatDiff) < HIT_WINDOW_BEATS * PERFECT_FRACTION;
             note.entryGrade = perfect ? "PERFECT" : "GOOD";
             note.sustain = "active";
@@ -194,7 +197,7 @@ function evaluateSustain(ls: LaneState, note: ActiveNote, currentBeat: number, b
     if (note.sustain === "active") {
         if (currentBeat >= endBeat) {
             completeSustain(ls, note);
-        } else if (!engaged) {
+        } else if (!sustainEngaged) {
             if (currentBeat >= endBeat - SUSTAIN_GRACE_BEATS) completeSustain(ls, note);
             else {
                 note.sustain = "failed";
@@ -268,11 +271,13 @@ function evaluateLane(ls: LaneState, currentBeat: number, laneInput: LaneInput, 
             }
             case "hold": {
                 const engaged = ev.button === "B" ? laneInput.bHeld : laneInput.aHeld;
-                evaluateSustain(ls, note, currentBeat, beatDiff, engaged);
+                evaluateSustain(ls, note, currentBeat, beatDiff, engaged, engaged);
                 break;
             }
             case "spin": {
-                evaluateSustain(ls, note, currentBeat, beatDiff, gr.spinning);
+                // Onset is a timed input (fresh acceleration pulse); staying
+                // engaged only needs the low-bar activity detector.
+                evaluateSustain(ls, note, currentBeat, beatDiff, gr.spinPulse, gr.spinning);
                 break;
             }
         }

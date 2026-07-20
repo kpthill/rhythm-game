@@ -28,20 +28,25 @@ Working list, brainstormed 2026-07-10. Roughly ordered later; capture first.
 
 ### Responsiveness
 
-- [ ] Scratches/spins are too "free" on the cabinet: spinner momentum keeps it
+- [x] Scratches/spins are too "free" on the cabinet: spinner momentum keeps it
       turning, so e.g. two right scratches in a row only need one physical input.
       Require **acceleration** for a scratch: starting from rest / changing
       direction (as now), or — new — speeding up while already moving in the same
       direction. Makes right-scratch → right-scratch a real input, and lets us
       judge scratch/spin *timing* ("does it accelerate at this moment") instead of
-      just "is it spinning".
-- [ ] Spins: require a timed input at onset (same acceleration logic), not just
-      "already spinning when the note arrives".
-- [ ] Keyboard/joystick unchanged: tap = scratch, hold = spin, judged with the
+      just "is it spinning". (gesture.ts v3: two-window rate comparison,
+      edge-triggered pulses; unit-tested.)
+- [x] Spins: require a timed input at onset (same acceleration logic), not just
+      "already spinning when the note arrives". (`spinPulse` is now the spin
+      note's entry input; sustain still uses the activity detector.)
+- [x] Keyboard/joystick unchanged: tap = scratch, hold = spin, judged with the
       same timing strictness (holding through a note without a fresh input ≠ hit).
       The emulator's spinner keys (`c`/`v` for spinner 1, `.`/`/` for spinner 2)
       should behave this way too — verify they arrive as step deltas and get the
-      same acceleration treatment.
+      same acceleration treatment. (Fallback press = surge from rest, hold =
+      steady rate → correct semantics fall out of the acceleration rule; unit-
+      tested. Emulator keys share the spinnerDelta path — worth one live sanity
+      check on the dev setup.)
 
 ### Spins / holds feedback
 
