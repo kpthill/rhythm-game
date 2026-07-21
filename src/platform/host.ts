@@ -125,6 +125,13 @@ export function boot(mount: HTMLElement): void {
         }
 
         p.setup = () => {
+            // Render at 3× regardless of the display's devicePixelRatio. p5
+            // defaults to displayDensity(): 2 on a retina laptop but 1 on the
+            // cabinet, where the shell then upscales a raw 336×262 backing
+            // store to the full screen — bilinear mush for thin lines and the
+            // small text this game leans on. A fixed high density gives the
+            // upscale real pixels to sample and makes dev and cabinet match.
+            p.pixelDensity(3);
             p.createCanvas(W, H);
             p.textFont("monospace");
             audio.load(SONG_FILE)
